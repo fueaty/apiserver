@@ -1,2 +1,0 @@
-这是一个用于测试企业微信文件推送功能的测试文件。
-Test file for WeWork file push functionality.
