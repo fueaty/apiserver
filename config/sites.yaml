@@ -1,0 +1,270 @@
+sites:
+  # 官方媒体（高权威性）
+  people_daily:
+    name: "人民日报"
+    enabled: true
+    rate_limit: 2
+    timeout: 15
+    request:
+      url: "https://www.people.com.cn/rss/politics.xml"
+    category: "官方媒体"
+    authority_level: "高"
+    
+  xinhua:
+    name: "新华社"
+    enabled: true
+    rate_limit: 2
+    timeout: 15
+    request:
+      url: "https://www.xinhuanet.com/rss/news.xml"
+    category: "官方媒体"
+    authority_level: "高"
+    
+  cctv:
+    name: "央视新闻"
+    enabled: true
+    rate_limit: 2
+    timeout: 15
+    request:
+      url: "https://news.cctv.com/rss/news.xml"
+    category: "官方媒体"
+    authority_level: "高"
+    
+  # chinanews:
+  #   name: "中新网"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 12
+  #   request:
+  #     url: "https://www.chinanews.com/rss/news.shtml"
+  #   category: "官方媒体"
+  #   authority_level: "中高"
+    
+  # thepaper:
+  #   name: "澎湃新闻"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 12
+  #   request:
+  #     url: "https://www.thepaper.cn/rss/news"
+  #   category: "官方媒体"
+  #   authority_level: "中高"
+    
+  # 社交媒体与热点发现
+  weibo:
+    name: "微博热搜榜"
+    enabled: true
+    rate_limit: 4
+    timeout: 10
+    request:
+      url: "https://s.weibo.com/top/summary"
+    category: "热点发现"
+    authority_level: "中"
+  
+  baidu:
+    name: "百度热搜榜"
+    enabled: true
+    rate_limit: 4
+    timeout: 10
+    request:
+      url: "https://top.baidu.com/board?tab=realtime"
+    category: "热点发现"
+    authority_level: "中"
+  
+  zhihu:
+    name: "知乎热榜"
+    enabled: true
+    rate_limit: 4
+    timeout: 10
+    request:
+      url: "https://www.zhihu.com/api/v3/feed/topstory/hot-lists/total"
+    category: "热点发现"
+    authority_level: "中"
+  
+  # 科技媒体
+  tech_36kr:
+    name: "36氪"
+    enabled: true
+    rate_limit: 3
+    timeout: 12
+    request:
+      url: "https://36kr.com/"
+    category: "科技媒体"
+    authority_level: "中高"
+  
+  # tech_geekpark:
+  #   name: "极客公园"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 12
+  #   request:
+  #     url: "https://www.geekpark.net/"
+  #   category: "科技媒体"
+  #   authority_level: "中高"
+  
+  # 财经媒体
+  # finance_eastmoney:
+  #   name: "东方财富"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 12
+  #   request:
+  #     url: "https://finance.eastmoney.com/"
+  #   category: "财经媒体"
+  #   authority_level: "中高"
+  
+  # 生活方式与设计
+  # xiaohongshu_trend:
+  #   name: "小红书热门话题"
+  #   enabled: true
+  #   rate_limit: 4
+  #   timeout: 12
+  #   request:
+  #     url: "https://www.xiaohongshu.com/discovery/home"
+  #   category: "热点发现"
+  #   authority_level: "中"
+  
+  # 小红书
+  xiaohongshu:
+    name: "小红书"
+    module: app.services.collection.sites.xiaohongshu
+    class: XiaohongshuSite
+    enabled: true
+    url: https://www.xiaohongshu.com/explore
+    encoding: utf-8
+    selector: "div.note-item"
+    fields:
+      title: ""
+      url: ""
+  
+    
+  # 家居与设计类平台
+  # xiaohongshu_home:
+  #   name: "小红书家居"
+  #   enabled: true
+  #   rate_limit: 4
+  #   timeout: 12
+  #   request:
+  #     url: "https://www.xiaohongshu.com/discovery/home"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # huaban:
+  #   name: "花瓣网"
+  #   enabled: true
+  #   rate_limit: 4
+  #   timeout: 12
+  #   request:
+  #     url: "https://huaban.com"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # zcool:
+  #   name: "站酷"
+  #   enabled: true
+  #   rate_limit: 4
+  #   timeout: 12
+  #   request:
+  #     url: "https://www.zcool.com.cn"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # jiane:
+  #   name: "建E网"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 15
+  #   request:
+  #     url: "https://www.jiane.com"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # zhimow:
+  #   name: "知末"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 15
+  #   request:
+  #     url: "https://www.zhimow.com"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # tuozhe:
+  #   name: "拓者设计吧"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 15
+  #   request:
+  #     url: "https://www.tuozhe8.com"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # mati:
+  #   name: "马蹄室内设计网"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 15
+  #   request:
+  #     url: "https://www.mati.hk"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # ida:
+  #   name: "室内设计联盟"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 15
+  #   request:
+  #     url: "https://www.ida.cn"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # dr:
+  #   name: "达人室内设计网"
+  #   enabled: true
+  #   rate_limit: 3
+  #   timeout: 15
+  #   request:
+  #     url: "https://www.daren.com"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # haohaozhu:
+  #   name: "好好住"
+  #   enabled: true
+  #   rate_limit: 4
+  #   timeout: 12
+  #   request:
+  #     url: "https://www.haohaozhu.cn"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # yidoutang:
+  #   name: "一兜糖"
+  #   enabled: true
+  #   rate_limit: 4
+  #   timeout: 12
+  #   request:
+  #     url: "https://www.yidoutang.com"
+  #   category: "家居与设计"
+  #   authority_level: "中"
+    
+  # 视觉素材来源配置
+  # visual_sources:
+  #   name: "视觉素材库"
+  #   enabled: true
+  #   rate_limit: 5
+  #   timeout: 15
+  #   sources:
+  #     - name: "官方发布会图片"
+  #       type: "图片"
+  #       authority: "高"
+  #     - name: "数据图表自制"
+  #       type: "图表"
+  #       authority: "中"
+  #       tool: "Canva"
+  #     - name: "相关产品实物图"
+  #       type: "产品图"
+  #       authority: "中"
+  #   category: "视觉素材"
+  #   authority_level: "中"

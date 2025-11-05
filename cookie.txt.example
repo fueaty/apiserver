@@ -1,0 +1,10 @@
+# Netscape HTTP Cookie File
+# https://curl.se/docs/http-cookies.html
+# 请在实际环境中使用真实的Cookie值
+
+# 小红书Cookie示例
+.xiaohongshu.com	TRUE	/	FALSE	0000000000	abRequestId	your_ab_request_id_here
+#HttpOnly_www.xiaohongshu.com	FALSE	/	FALSE	0000000000	acw_tc	your_acw_tc_cookie_here
+
+# 其他平台Cookie示例
+#.example.com	TRUE	/	FALSE	0000000000	cookie_name	cookie_value

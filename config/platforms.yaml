@@ -1,0 +1,304 @@
+publish_platforms:
+  zhihu:
+    name: "知乎专栏"
+    enabled: true
+    rate_limit: 10
+    timeout: 15
+    request:
+      method: "POST"
+      url: "https://api.zhihu.com/articles"
+      headers:
+        Content-Type: "application/json"
+      field_mapping:
+        title:
+          source: "title"
+        content:
+          source: "body"
+        image_urls:
+          source: "images"
+        topics:
+          source: "tags"
+        publish_time:
+          source: "schedule_time"
+    constraints:
+      max_title_length: 100
+      max_body_length: 50000
+    selection_rules:
+      target_audience: ["高知人群", "学生群体", "职场人士"]
+      content_preferences: ["科技专业分析", "技术讨论", "实用技巧", "资源盘点"]
+      content_style: "专业分析, 问答形式, 数据驱动"
+      optimal_length: "1000-3000字"
+      best_post_times: ["20:00-23:00", "09:00-11:00"]
+      domain_focus:
+        primary: "科技"
+        secondary: "生活"
+        content_types:
+          - "专业问答"
+          - "技术讨论"
+          - "实用技巧"
+          - "资源盘点"
+        avoid_domains: ["未经证实的政治传闻", "极端观点"]
+      scoring_weights:
+        content_match: 0.4
+        audience_relevance: 0.3
+        timeliness: 0.2
+        engagement_potential: 0.1
+  
+  weibo:
+    name: "微博文章"
+    enabled: true
+    rate_limit: 5
+    timeout: 10
+    request:
+      method: "POST"
+      url: "https://weibo.com/api/article/publish"
+      headers:
+        Content-Type: "application/json"
+      field_mapping:
+        body:
+          source: "body"
+        title:
+          source: "title"
+        tags:
+          source: "tags"
+    constraints:
+      max_text_length: 2000
+    # 选材规则配置
+    selection_rules:
+      target_audience: ["年轻用户", "都市人群"]
+      content_preferences: ["社会热点", "娱乐资讯", "生活分享"]
+      content_style: "简洁明了, 时效性强, 互动性强"
+      optimal_length: "200-500字"
+      best_post_times: ["12:00-14:00", "19:00-22:00"]
+      scoring_weights:
+        content_match: 0.3
+        audience_relevance: 0.3
+        timeliness: 0.3
+        engagement_potential: 0.1
+  
+  juejin:
+    name: "掘金文章"
+    enabled: true
+    rate_limit: 8
+    timeout: 12
+    request:
+      method: "POST"
+      url: "https://api.juejin.cn/content_api/v1/article/publish"
+      headers:
+        Content-Type: "application/json"
+      field_mapping:
+        title:
+          source: "title"
+        content:
+          source: "body"
+        image_urls:
+          source: "images"
+        tag_ids:
+          source: "tags"
+        category_id:
+          source: "category"
+    constraints:
+      max_title_length: 100
+      max_body_length: 50000
+      max_images: 10
+      max_tags: 5
+    selection_rules:
+      target_audience: ["开发者", "技术爱好者"]
+      content_preferences: ["技术教程", "开发经验", "行业趋势"]
+      content_style: "技术导向, 实用性强, 代码示例"
+      optimal_length: "1500-4000字"
+      best_post_times: ["09:00-12:00", "14:00-18:00"]
+      scoring_weights:
+        content_match: 0.4
+        audience_relevance: 0.4
+        timeliness: 0.1
+        engagement_potential: 0.1
+
+  zhihu:
+    name: "知乎专栏"
+    enabled: true
+    rate_limit: 10
+    timeout: 15
+    request:
+      method: "POST"
+      url: "https://api.zhihu.com/articles"
+      headers:
+        Content-Type: "application/json"
+      field_mapping:
+        title:
+          source: "title"
+        content:
+          source: "body"
+        image_urls:
+          source: "images"
+        topics:
+          source: "tags"
+        publish_time:
+          source: "schedule_time"
+    constraints:
+      max_title_length: 100
+      max_body_length: 50000
+    selection_rules:
+      target_audience: ["高知人群", "学生群体", "职场人士"]
+      content_preferences: ["科技专业分析", "技术讨论", "实用技巧", "资源盘点"]
+      content_style: "专业分析, 问答形式, 数据驱动"
+      optimal_length: "1000-3000字"
+      best_post_times: ["20:00-23:00", "09:00-11:00"]
+      domain_focus:
+        primary: "科技"
+        secondary: "生活"
+        content_types:
+          - "专业问答"
+          - "技术讨论"
+          - "实用技巧"
+          - "资源盘点"
+        avoid_domains: ["未经证实的政治传闻", "极端观点"]
+      scoring_weights:
+        content_match: 0.4
+        audience_relevance: 0.3
+        timeliness: 0.2
+        engagement_potential: 0.1
+  
+  xiaohongshu:
+    name: "小红书"
+    enabled: true
+    rate_limit: 6
+    timeout: 10
+    request:
+      method: "POST"
+      url: "https://edith.xiaohongshu.com/api"
+      headers:
+        Content-Type: "application/json"
+      field_mapping:
+        title:
+          source: "title"
+        content:
+          source: "body"
+        image_urls:
+          source: "images"
+        tags:
+          source: "tags"
+    constraints:
+      max_title_length: 50
+      max_body_length: 1000
+      max_images: 9
+    # 选材规则配置 - 差异化布局
+    selection_rules:
+      target_audience: ["年轻女性", "都市青年", "生活爱好者"]
+      content_preferences: ["视觉化干货", "穿搭攻略", "家居改造", "设计分享"]
+      content_style: "视觉导向, 情感共鸣, 个人故事, 实用性强"
+      optimal_length: "500-1000字"
+      best_post_times: ["19:00-22:00", "12:00-14:00"]
+      # 领域差异化配置
+      domain_focus:
+        primary: "生活"
+        secondary: "科技"
+        content_types:
+          - "视觉化干货"
+          - "穿搭攻略"
+          - "家居改造"
+          - "设计分享"
+          - "产品体验"
+        avoid_domains: ["政治", "社会争议话题"]
+      scoring_weights:
+        content_match: 0.4
+        audience_relevance: 0.3
+        timeliness: 0.2
+        engagement_potential: 0.1
+  
+  wechat_public:
+    name: "微信公众号"
+    enabled: true
+    rate_limit: 3
+    timeout: 20
+    request:
+      method: "POST"
+      url: "https://api.weixin.qq.com/cgi-bin/material/add_news"
+      headers:
+        Content-Type: "application/json"
+      field_mapping:
+        title:
+          source: "title"
+        content:
+          source: "body"
+        image_urls:
+          source: "images"
+        author:
+          source: "author"
+        digest:
+          source: "summary"
+    constraints:
+      max_title_length: 64
+      max_body_length: 20000
+      max_images: 3
+    # 选材规则配置 - 差异化布局
+    selection_rules:
+      target_audience: ["职场人士", "知识型用户", "科技从业者"]
+      content_preferences: ["深度行业报告", "技术趋势分析", "AI工具评测", "互联网政策解读"]
+      content_style: "专业深度, 权威性内容, 结构清晰, 价值导向"
+      optimal_length: "2000-5000字"
+      best_post_times: ["08:00-10:00", "20:00-22:00"]
+      # 领域差异化配置
+      domain_focus:
+        primary: "科技"
+        secondary: "政治"
+        content_types:
+          - "深度行业报告"
+          - "技术趋势分析"
+          - "AI工具评测"
+          - "互联网政策解读"
+          - "官方政策摘要"
+          - "正面政策解读"
+        avoid_domains: ["娱乐八卦", "主观情绪化内容"]
+        political_restrictions:
+          allowed_types: ["官方政策摘要", "正面政策解读"]
+          avoid_types: ["敏感话题", "未经证实传闻"]
+      scoring_weights:
+        content_match: 0.5
+        audience_relevance: 0.3
+        timeliness: 0.1
+        engagement_potential: 0.1
+  
+  toutiao:
+    name: "今日头条"
+    enabled: true
+    rate_limit: 8
+    timeout: 10
+    request:
+      method: "POST"
+      url: "https://mp.toutiao.com/api/article/publish"
+      headers:
+        Content-Type: "application/json"
+      field_mapping:
+        title:
+          source: "title"
+        content:
+          source: "body"
+        image_urls:
+          source: "images"
+        tags:
+          source: "tags"
+    constraints:
+      max_title_length: 30
+      max_body_length: 5000
+      max_images: 5
+    selection_rules:
+      target_audience: ["大众用户", "资讯消费者", "普通网民"]
+      content_preferences: ["实时政策快讯", "社会新闻摘要", "科技热点短讯"]
+      content_style: "简洁明了, 时效性强, 重点突出, 通俗易懂"
+      optimal_length: "500-1500字"
+      best_post_times: ["07:00-09:00", "12:00-14:00", "18:00-20:00"]
+      domain_focus:
+        primary: "政治"
+        secondary: "科技"
+        content_types:
+          - "实时政策快讯"
+          - "社会新闻摘要"
+          - "科技热点短讯"
+          - "大众化话题"
+        avoid_domains: ["专业术语过多的深度分析"]
+      scoring_weights:
+        content_match: 0.3
+        audience_relevance: 0.3
+        timeliness: 0.3
+        engagement_potential: 0.1

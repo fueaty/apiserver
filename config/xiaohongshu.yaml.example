@@ -1,0 +1,63 @@
+# 小红书API配置文件
+# 请在获取到相关凭证后填写以下信息
+
+# 应用凭证 (从开放平台获取)
+app:
+  # App Key (从开放平台应用管理页面获取)
+  key: "YOUR_APP_KEY"
+  # App Secret (从开放平台应用管理页面获取)
+  secret: "YOUR_APP_SECRET"
+
+# 访问令牌 (通过OAuth流程或直接获取)
+access_token: "YOUR_ACCESS_TOKEN"
+# 刷新令牌 (用于刷新access_token)
+refresh_token: "YOUR_REFRESH_TOKEN"
+
+# Cookie配置 (网页版登录cookie)
+cookie:
+  # 完整的cookie字符串
+  auth: "YOUR_COOKIE_STRING"
+  # 或者分别填写关键cookie项
+  sid: "YOUR_SID"
+  session: "YOUR_SESSION"
+
+# API基础配置
+api:
+  # API基础URL
+  base_url: "https://ark.xiaohongshu.com"
+  # 接口版本
+  version: "v1"
+
+# 网页版配置
+web:
+  # 网页版基础URL
+  base_url: "https://www.xiaohongshu.com"
+  # 请求头配置
+  headers:
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36"
+    referer: "https://www.xiaohongshu.com/"
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+    accept_language: "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2"
+
+# 采集配置
+collection:
+  # 默认采集频道
+  default_channel: "homefeed_recommend"
+  # 支持的频道列表
+  channels:
+    - "homefeed.fashion_v3"     # 穿搭
+    - "homefeed.food_v3"        # 美食
+    - "homefeed.cosmetics_v3"   # 彩妆
+    - "homefeed.movie_and_tv_v3" # 影视
+    - "homefeed.career_v3"      # 职场
+    - "homefeed.love_v3"        # 情感
+    - "homefeed.household_product_v3" # 家居
+    - "homefeed.gaming_v3"      # 游戏
+    - "homefeed.travel_v3"      # 旅行
+    - "homefeed.fitness_v3"     # 健身
+    - "homefeed_recommend"      # 推荐
+  
+  # 每次采集的数据条数
+  limit: 30
+  # 请求超时时间(秒)
+  timeout: 30

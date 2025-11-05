@@ -1,0 +1,46 @@
+# 知乎API配置文件
+# 请在获取到相关凭证后填写以下信息
+
+# 访问令牌 (通过开发者工具获取)
+access_token: "your_access_token_here"
+# 或者使用完整的Authorization头
+authorization: "Bearer your_token_here"
+
+# Cookie配置 (网页版登录cookie)
+cookie:
+  # 完整的cookie字符串
+  auth: "your_complete_cookie_here"
+  # 或者分别填写关键cookie项
+  z_c0: "your_z_c0_cookie_here"
+  _xsrf: "your_xsrf_token_here"
+
+# API基础配置
+api:
+  # API基础URL
+  base_url: "https://www.zhihu.com"
+  # 热榜API路径
+  hotlist_endpoint: "/api/v3/feed/topstory/hot-lists/total"
+  # 接口版本
+  version: "v3"
+
+# 网页版配置
+web:
+  # 网页版基础URL
+  base_url: "https://www.zhihu.com"
+  # 热榜页面路径
+  hotlist_path: "/hot"
+  # 请求头配置
+  headers:
+    user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36"
+    referer: "https://www.zhihu.com/hot"
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+    accept_language: "zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2"
+
+# 采集配置
+collection:
+  # 默认超时时间（秒）
+  timeout: 10
+  # 最大重试次数
+  max_retries: 3
+  # 采集结果数量限制
+  result_limit: 50

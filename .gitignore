@@ -1,0 +1,66 @@
+# 忽略敏感配置文件
+config/credentials.yaml
+secret/
+
+# 忽略日志文件
+*.log
+
+# 忽略环境文件
+.env
+.env.*
+!.env.example
+
+# 忽略平台配置文件
+config/zhihu.yaml
+config/xiaohongshu.yaml
+
+# 忽略Cookie文件
+cookie.txt
+
+# 忽略临时文件
+tmp/
+temp/
+.cache/
+
+# 忽略数据文件
+*.json
+*.db
+
+# 忽略 Python 编译文件
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.coverage
+.pytest_cache/
+
+# 忽略加密密钥和认证信息
+secret/.encryption_key
+secret/auth_key.json
+secret/auth_key.mdl
+secret/generate_auth_key.py
+
+# 忽略开发工具和IDE文件
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 忽略操作系统文件
+.DS_Store
+Thumbs.db
+
+# 忽略Docker构建缓存
+.docker/
+
+# 确保保留示例文件
+!config/credentials.yaml.example
+!secret/auth_key.json.example
+!secret/auth_key.mdl.example
+!secret/generate_auth_key.py.example
+
+# 保留加密版本的凭证文件
+!config/credentials.yaml.encrypted
