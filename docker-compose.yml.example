@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  # API服务器
+  apiserver:
+    build: .
+    container_name: apiserver
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+      - mongodb
+    networks:
+      - app-network
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - MONGODB_URL=mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongodb:27017/
+      - ENCRYPTION_PASSWORD=${ENCRYPTION_PASSWORD}
+      - SIGNATURE_SECRET=${SIGNATURE_SECRET}
+
+  # Redis服务（用于Celery任务队列和缓存）
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - app-network
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+
+  # MongoDB数据库
+  mongodb:
+    image: mongodb:latest
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - app-network
+
+  # Playwright浏览器服务（可选，用于高级采集）
+  playwright:
+    image: mcr.microsoft.com/playwright:v1.55.0-jammy
+    container_name: playwright
+    volumes:
+      - ./app:/app
+    networks:
+      - app-network
+
+volumes:
+  redis_data:
+  mongodb_data:
+
+networks:
+  app-network:
+    driver: bridge
