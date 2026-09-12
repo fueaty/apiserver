@@ -4,6 +4,7 @@
 - 审计基准：`HEAD = b1a0742e11c446e9a2b945f1ee815bf7829bc836`
 - 审计方法：`git log --all --graph`、`git show --stat`、`git diff-tree --name-status`、`git show <sha>:<path>` 逐条核验真实 diff
 - 审计日期：2026-09-12
+- ⚠️ **历史重写说明**：本报告完成于历史重写**之前**，正文中所有 SHA 均为**重写前**的旧对象。2026-09-12 为抹除泄露的飞书表格标识，仓库做了全历史重写，旧 SHA 已全部失效。**阅读与复现时请配合文末「附录 A：历史重写后的 SHA 映射」。**
 
 ---
 
@@ -193,3 +194,36 @@ def deduplicate_items(items):
 ---
 
 *本报告所有数据均来自 Git 对象库直接读取，可通过报告中的 SHA 与命令复现。*
+
+> ⚠️ 由于 2026-09-12 的全历史重写，正文中的**旧 SHA 已不可解析**，复现请使用附录 A 的新 SHA。
+
+---
+
+## 附录 A：历史重写后的 SHA 映射（2026-09-12 追加）
+
+为避免泄露的飞书表格标识随历史外传，仓库于 2026-09-12 执行了**全历史重写**：所有提交经 `git commit-tree` 重新生成，含标识的 4 个文件（README.md、feishu_data_loader.py、doc/hotspot_feature_analysis_design.md、doc/开发设计.md）被替换为占位符，随后以 `git clone --no-local --bare` 生成全新对象库并整体换入。**旧 SHA 已全部无法解析。**
+
+| 报告正文中的旧 SHA | 重写后的新 SHA | 提交信息 | 判定（不变） |
+|---|---|---|---|
+| `22ae8bf` | `2902b1c` | 新建项目 | 基线（不计入） |
+| `309cf31` | `20ea9de` | 删除多余文件 | **无效**（对基线的回滚） |
+| `6015c34` | `f1a5f31` | docs: 更新README文档为详细系统设计文档 | 无效（纯文档） |
+| `b1a0742` | `c487174` | 同步脚本为最新版本 | **有效** |
+| `a528f2a`（本报告写就后才产生） | `7667b0e` | feat: 合并远程飞书数据清理与历史数据管理功能 | 另行提交，不参与口径计算 |
+| （重写后新增） | `9247dc6` | feat: 新增澎湃新闻采集、commit 有效性审计报告并脱敏飞书标识 | 另行提交，不参与口径计算 |
+
+复现示例（请用新 SHA）：
+
+```bash
+git diff-tree --name-status -M 20ea9de                          # 原 309cf31
+git show --stat c487174                                         # 原 b1a0742
+git grep -n "def deduplicate_items" c487174 -- script/deduplicate_collect.py
+git show --stat f1a5f31                                         # 原 6015c34
+```
+
+**重写对审计结论的影响：无。** 判定依据的是各提交的**内容差异**（新增/删除的文件、行数、`A→D` 对称性），而重写只替换了 4 个文档与死代码文件中的飞书标识，未改动任何提交的变更范围、文件结构或提交顺序，故「有效 commit 净数量 = 1，占比 1/3 = 33%」的结论保持不变。
+
+**重写过程中同时确认的两点：**
+
+1. 被替换的 4 个文件中，3 个为纯文档（README.md、两份设计文档），1 个为死代码 —— `app/services/analysis/feature_analysis/feishu_data_loader.py` 调用了项目中并不存在的 `config_manager.get_config()`，实例化即 `AttributeError`，从未参与运行。**故本次脱敏对仓库功能零影响。**
+2. 真实运行时凭据存放于 `config/credentials.yaml`（已被 `.gitignore` 忽略，历史中从未提交），**全程未被改动**。
