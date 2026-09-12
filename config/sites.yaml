@@ -40,15 +40,15 @@ sites:
   #   category: "官方媒体"
   #   authority_level: "中高"
     
-  # thepaper:
-  #   name: "澎湃新闻"
-  #   enabled: true
-  #   rate_limit: 3
-  #   timeout: 12
-  #   request:
-  #     url: "https://www.thepaper.cn/rss/news"
-  #   category: "官方媒体"
-  #   authority_level: "中高"
+  thepaper:
+    name: "澎湃新闻"
+    enabled: true
+    rate_limit: 3
+    timeout: 15
+    request:
+      url: "https://www.thepaper.cn/"
+    category: "官方媒体"
+    authority_level: "中高"
     
   # 社交媒体与热点发现
   weibo:
