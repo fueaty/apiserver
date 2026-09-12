@@ -10,7 +10,6 @@ import os
 import asyncio
 import traceback
 from datetime import datetime
-import httpx
 from collections import defaultdict
 
 # 添加项目根目录到Python路径，使得可以导入项目内的模块
@@ -20,7 +19,13 @@ sys.path.append("..")
 # 导入所需的模块和服务
 from app.services.collection.engine import CollectionEngine      # 数据采集引擎
 from app.services.selection.engine import SelectionEngine       # 选材引擎
-from app.services.feishu.feishu_service import FeishuService    # 飞书服务
+from app.services.feishu.feishu_service import FeishuService, parse_record_time  # 飞书服务
+from app.services.feishu.limits import (
+    LIST_PAGE_SIZE,
+    TABLE_RECORD_LIMIT,
+    ERR_RECORD_EXCEED_LIMIT,
+    describe,
+)
 from app.core.config import config_manager                     # 配置管理器
 import app.wework.notification_push as notification_push
 
@@ -119,10 +124,11 @@ async def test_collection_pipeline():
         page_token = None
         
         # 分页获取所有今日数据
-        # 注意：必须使用较大的page_size以确保获取所有数据，避免遗漏
+        # 注意：使用 LIST_PAGE_SIZE(500) 拿到飞书单页上限，20000 条也只需 40 次请求；
+        # 旧实现写的是 100，会翻 200 页，既慢又容易在中途被限流。
         while True:
             page_data = await feishu_service.list_records(
-                app_token, table_id, page_size=100, page_token=page_token
+                app_token, table_id, page_size=LIST_PAGE_SIZE, page_token=page_token
             )
             items = page_data.get("items", [])
             if not items:
@@ -130,17 +136,14 @@ async def test_collection_pipeline():
                 
             # 筛选今日数据
             for item in items:
-                if "fields" in item and "collected_at" in item["fields"]:
-                    collected_at_str = item["fields"]["collected_at"]
-                    try:
-                        # 解析收集时间，格式为 "YYYY-MM-DD HH:MM:SS"
-                        collected_date = datetime.strptime(collected_at_str, "%Y-%m-%d %H:%M:%S").date()
-                        # 检查是否为今天收集的数据
-                        if collected_date.strftime("%Y-%m-%d") == today:
-                            all_existing_records.append(item)
-                    except ValueError:
-                        # 忽略日期格式错误的记录
-                        pass
+                fields = item.get("fields") or {}
+                if "collected_at" not in fields:
+                    continue
+                # 用统一解析器同时兜住 "%Y-%m-%d %H:%M:%S" 与 ISO8601 两种历史写法。
+                # 旧实现只认前者，遇到 ISO 格式会静默 pass，导致去重失效、重复记录堆积。
+                collected_dt = parse_record_time(fields.get("collected_at"))
+                if collected_dt and collected_dt.date().strftime("%Y-%m-%d") == today:
+                    all_existing_records.append(item)
             
             # 检查是否有更多页面
             page_token = page_data.get("page_token")
@@ -176,27 +179,12 @@ async def test_collection_pipeline():
         if records_to_delete:
             print("   删除重复记录...")
             try:
-                # 构造删除记录的API URL
-                url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete"
-                # 获取飞书访问令牌
-                token = await feishu_service.get_tenant_access_token()
-                # 设置请求头
-                headers = {
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json; charset=utf-8"
-                }
-                
-                # 发送POST请求删除记录
-                delete_data = {"records": records_to_delete}
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(url, headers=headers, json=delete_data, timeout=30)
-                    response.raise_for_status()
-                    result = response.json()
-                    # 检查删除结果
-                    if result.get("code") == 0:
-                        print(f"   成功删除 {len(records_to_delete)} 条重复记录")
-                    else:
-                        print(f"   删除重复记录失败: {result.get('msg')}")
+                # 统一走 FeishuService.delete_records：按 500 分片 + 正确的 string[] 请求体。
+                # 旧实现自己拼 payload 且一次提交全量 id，一旦超过 500 条就会整批失败。
+                deleted = await feishu_service.delete_records(
+                    app_token, table_id, records_to_delete
+                )
+                print(f"   成功删除 {deleted}/{len(records_to_delete)} 条重复记录")
             except Exception as e:
                 print(f"   删除重复记录时发生异常: {e}")
         
@@ -224,33 +212,36 @@ async def test_collection_pipeline():
         if records_to_delete:
             print("   删除已存在的记录...")
             try:
-                # 构造删除记录的API URL
-                url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete"
-                # 获取飞书访问令牌
-                token = await feishu_service.get_tenant_access_token()
-                # 设置请求头
-                headers = {
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json; charset=utf-8"
-                }
-                
-                # 发送POST请求删除记录
-                delete_data = {"records": records_to_delete}
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(url, headers=headers, json=delete_data, timeout=30)
-                    response.raise_for_status()
-                    result = response.json()
-                    # 检查删除结果
-                    if result.get("code") == 0:
-                        print(f"   成功删除 {len(records_to_delete)} 条已存在记录")
-                    else:
-                        print(f"   删除已存在记录失败: {result.get('msg')}")
+                deleted = await feishu_service.delete_records(
+                    app_token, table_id, records_to_delete
+                )
+                print(f"   成功删除 {deleted}/{len(records_to_delete)} 条已存在记录")
             except Exception as e:
                 print(f"   删除已存在记录时发生异常: {e}")
         
         # 批量新增记录
         # 对于新记录和需要替换的记录，使用飞书服务的批量添加功能
         if records_to_create:
+            # 写前容量预检：飞书单表硬上限 20,000 条（1254103 RecordExceedLimit），
+            # 超限后写入会整体失败。这里按「清理后剩余 + 本次待写入」提前腾空间，
+            # 让清理从"事后补救"变成"写前保证"。
+            print("   写前容量预检...")
+            try:
+                capacity = await feishu_service.ensure_capacity(
+                    app_token, table_id, incoming=len(records_to_create)
+                )
+                print(f"   容量状态: {describe(capacity['count_after'])} | {capacity['message']}")
+                if capacity["deleted_total"] > 0:
+                    print(f"   已清理 {capacity['deleted_total']} 条最旧记录"
+                          f"（按容量 {capacity['deleted_by_capacity']} 条）")
+                if not capacity["ok"]:
+                    warn = f"⚠️ 飞书表格容量告警\n{capacity['message']}"
+                    notification_push.send_message(warn)
+                    print(warn)
+            except Exception as exc:
+                # 容量预检本身失败不应阻断采集，batch_add_records 内部还有一次超限自愈
+                print(f"   ⚠️ 容量预检失败（继续写入，由写入层自愈兜底）: {exc}")
+
             print("   创建记录...")
             result = await feishu_service.batch_add_records(app_token, table_id, records_to_create)
             
@@ -261,7 +252,13 @@ async def test_collection_pipeline():
                 notification_push.send_message(msg)
                 print(msg)
             else:
-                msg = f"❌ 采集任务执行失败，创建记录到飞书多维表格异常:\n{result.get('msg')}"
+                code = result.get("code")
+                hint = ""
+                if code == ERR_RECORD_EXCEED_LIMIT:
+                    hint = (f"\n原因: 单表记录数已达上限 {TABLE_RECORD_LIMIT} 条，"
+                            f"且紧急清理未能腾出足够空间，请人工介入。")
+                msg = (f"❌ 采集任务执行失败，创建记录到飞书多维表格异常:\n"
+                       f"code={code} {result.get('msg')}{hint}")
                 notification_push.send_message(msg)
                 print(msg)
                 return False

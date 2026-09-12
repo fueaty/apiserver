@@ -1,17 +1,79 @@
+import asyncio
 import time
 import httpx
+from datetime import datetime, timedelta
 from functools import lru_cache
-from typing import Dict, Any, Optional, Set, Tuple
+from typing import Dict, Any, List, Optional, Set, Tuple
 import lark_oapi as lark
 from lark_oapi.api.bitable.v1 import *
 from ...core.config import config_manager
 from .field_rules import FIELD_DEFINITIONS, REQUIRED_FIELDS
+from .limits import (
+    TABLE_RECORD_LIMIT,
+    BATCH_WRITE_LIMIT,
+    WATERMARK,
+    WARNING,
+    LIST_PAGE_SIZE,
+    ERR_RECORD_EXCEED_LIMIT,
+    describe,
+)
 
 # API URL 常量
 FEISHU_TENANT_ACCESS_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
 FEISHU_BITABLE_RECORDS_BATCH_CREATE_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
+FEISHU_BITABLE_RECORDS_BATCH_DELETE_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete"
 FEISHU_BITABLE_FIELDS_LIST_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
 FEISHU_BITABLE_FIELD_DELETE_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}"
+
+
+def parse_record_time(value: Any) -> Optional[datetime]:
+    """
+    尽量把飞书返回的 collected_at 解析成 naive datetime。
+
+    飞书文本字段可能返回 str、list[dict]（富文本）或数字时间戳，历史数据里
+    同时存在 "%Y-%m-%d %H:%M:%S" 与 ISO8601（带时区偏移）两种写法，这里统一兜住。
+    解析失败返回 None，调用方应按“时间未知”处理。
+    """
+    if value is None:
+        return None
+
+    # 富文本字段：[{"text": "2026-09-12 10:00:00", "type": "text"}]
+    if isinstance(value, list):
+        if not value:
+            return None
+        first = value[0]
+        if isinstance(first, dict):
+            value = first.get("text") or first.get("value") or ""
+        else:
+            value = first
+
+    # 毫秒 / 秒级时间戳
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        ts = value / 1000 if value > 1e11 else value
+        try:
+            return datetime.fromtimestamp(ts)
+        except (ValueError, OSError, OverflowError):
+            return None
+
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+
+    # ISO8601（可能带 +08:00 / Z）。与历史实现保持一致：直接去掉时区，不做换算。
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    return None
 
 class FeishuService:
     def __init__(self):
@@ -390,8 +452,19 @@ class FeishuService:
             else:
                 raise Exception(f"获取飞书表格字段失败: {data.get('msg')}")
 
-    async def batch_add_records(self, app_token: str, table_id: str, records: list) -> dict:
-        """批量向飞书多维表格添加记录，并预先检查和对齐字段"""
+    async def batch_add_records(self, app_token: str, table_id: str, records: list,
+                                _retry_on_full: bool = True) -> dict:
+        """
+        批量向飞书多维表格添加记录，并预先检查和对齐字段。
+
+        飞书单表有 20,000 条硬上限（错误码 1254103 RecordExceedLimit），写满后
+        任何写入都会整体失败。本方法是项目内所有批量写入的唯一收口，因此在这里
+        内置**超限自愈**：一旦命中 1254103，先做一次容量清理，再把剩余记录重试
+        一遍，避免采集任务/发布流程直接报错中断。
+
+        Args:
+            _retry_on_full: 内部使用，防止自愈重试无限递归
+        """
         token = await self.get_tenant_access_token()
         
         # 使用不带缓存的方法获取表格字段
@@ -411,13 +484,359 @@ class FeishuService:
             raise ValueError("数据字段与目标表格完全不匹配，没有可写入的数据。")
 
         # 使用HTTP请求批量添加记录
+        # 飞书单次写接口最多操作 500 条（错误码 1254104），必须分片提交；
+        # 分片之间留 0.3s 间隔，规避同一张表并发写触发的 1254291 Write conflict。
         url = FEISHU_BITABLE_RECORDS_BATCH_CREATE_URL.format(app_token=app_token, table_id=table_id)
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json; charset=utf-8"
         }
-        
+
+        total = len(aligned_records)
+        created_records: List[dict] = []
+
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json={"records": aligned_records}, timeout=30)
-            response.raise_for_status()
-            return response.json()
+            for start in range(0, total, BATCH_WRITE_LIMIT):
+                chunk = aligned_records[start:start + BATCH_WRITE_LIMIT]
+                chunk_no = start // BATCH_WRITE_LIMIT + 1
+                response = await client.post(url, headers=headers, json={"records": chunk}, timeout=30)
+                response.raise_for_status()
+                result = response.json()
+
+                if result.get("code") != 0:
+                    code = result.get("code")
+
+                    # ---- 超限自愈：清理 -> 重试剩余 ----
+                    if code == ERR_RECORD_EXCEED_LIMIT and _retry_on_full:
+                        pending = aligned_records[start:]
+                        print(f"[WARN] 第 {chunk_no} 批命中 RecordExceedLimit(1254103)，"
+                              f"表格已达 {TABLE_RECORD_LIMIT} 条上限。"
+                              f"执行紧急清理后将重试剩余 {len(pending)} 条...")
+                        try:
+                            stats = await self.ensure_capacity(
+                                app_token, table_id, incoming=len(pending)
+                            )
+                            print(f"[WARN] 紧急清理结果: {stats['message']}")
+                        except Exception as exc:
+                            print(f"[ERROR] 紧急清理失败，仍尝试重试写入: {exc}")
+
+                        retry = await self.batch_add_records(
+                            app_token, table_id, pending, _retry_on_full=False
+                        )
+                        if retry.get("code") == 0:
+                            created_records.extend(
+                                retry.get("data", {}).get("records", [])
+                            )
+                            print(f"[WARN] 自愈重试成功，本次共写入 "
+                                  f"{len(created_records)} 条")
+                            break
+
+                        # 自愈仍失败：回传失败信息
+                        retry["data"] = {"records": created_records}
+                        retry["failed_chunk"] = chunk_no
+                        retry["failed_count"] = len(pending)
+                        return retry
+
+                    # 其他错误：把已成功写入的记录一并回传，避免调用方误判为"全部失败"
+                    print(f"[ERROR] 第 {chunk_no} 批写入失败: "
+                          f"code={code} msg={result.get('msg')}")
+                    result["data"] = {"records": created_records}
+                    result["failed_chunk"] = chunk_no
+                    result["failed_count"] = len(chunk)
+                    return result
+
+                created_records.extend(result.get("data", {}).get("records", []))
+                if start + BATCH_WRITE_LIMIT < total:
+                    await asyncio.sleep(0.3)
+
+        return {
+            "code": 0,
+            "msg": "success",
+            "data": {"records": created_records},
+        }
+
+    # ------------------------------------------------------------------
+    # 容量管理：飞书单表上限 20,000 条（错误码 1254103），超限后任何写入都会
+    # 直接失败。飞书没有 count 接口，只能全表分页累加，因此下面的方法都基于
+    # 一次全表扫描，尽量只扫一遍。
+    # ------------------------------------------------------------------
+
+    async def scan_records(self, app_token: str, table_id: str,
+                           page_size: int = LIST_PAGE_SIZE) -> List[Tuple[str, Any]]:
+        """
+        全表分页扫描，返回 [(record_id, collected_at 原始值), ...]。
+
+        一次扫描同时拿到总条数和排序所需的采集时间，避免清理时反复翻页。
+        """
+        rows: List[Tuple[str, Any]] = []
+        page_token = None
+
+        while True:
+            data = await self.list_records(
+                app_token, table_id, page_size=page_size, page_token=page_token
+            )
+            items = data.get("items", [])
+            if not items:
+                break
+
+            for item in items:
+                fields = item.get("fields") or {}
+                rows.append((item.get("record_id"), fields.get("collected_at")))
+
+            page_token = data.get("page_token")
+            if not page_token:
+                break
+
+        return rows
+
+    async def get_record_count(self, app_token: str, table_id: str) -> int:
+        """获取表格当前记录总数。"""
+        rows = await self.scan_records(app_token, table_id)
+        return len(rows)
+
+    async def delete_records(self, app_token: str, table_id: str,
+                             record_ids: List[str]) -> int:
+        """
+        分批删除记录，返回**实际删除成功**的条数。
+
+        单次 batch_delete 最多 500 条（错误码 1254104），因此按 BATCH_WRITE_LIMIT
+        分片；分片之间留 0.3s 间隔，规避 Write conflict（1254291，删除也属于写接口）。
+        单个分片失败不影响后续分片，避免一条脏数据导致整轮清理中断。
+
+        ⚠️ 请求体格式**必须是纯字符串数组**：{"records": ["rec1", "rec2"]}。
+        官方文档中 records 的类型是 string[]；若传 [{"record_id": "rec1"}] 这种
+        对象数组，接口会直接返回 HTTP 400 Bad Request。历史版本正是踩了这个坑，
+        导致清理脚本"计划删除 19823 条、实际成功 0 条"。
+        参考: https://open.feishu.cn/document/server-docs/docs/bitable-v1/app-table-record/batch_delete
+        """
+        if not record_ids:
+            return 0
+
+        token = await self.get_tenant_access_token()
+        url = FEISHU_BITABLE_RECORDS_BATCH_DELETE_URL.format(
+            app_token=app_token, table_id=table_id
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+
+        total = len(record_ids)
+        deleted = 0
+
+        async with httpx.AsyncClient() as client:
+            for start in range(0, total, BATCH_WRITE_LIMIT):
+                chunk = record_ids[start:start + BATCH_WRITE_LIMIT]
+                chunk_no = start // BATCH_WRITE_LIMIT + 1
+                # string[] —— 不要改成 [{"record_id": ...}]
+                payload = {"records": [str(rid) for rid in chunk]}
+
+                try:
+                    response = await client.post(
+                        url, headers=headers, json=payload, timeout=30
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                except Exception as exc:
+                    print(f"[ERROR] 第 {chunk_no} 批删除异常: {exc}")
+                    continue
+
+                if result.get("code") == 0:
+                    deleted += len(chunk)
+                else:
+                    print(f"[ERROR] 第 {chunk_no} 批删除失败: "
+                          f"code={result.get('code')} msg={result.get('msg')}")
+
+                if start + BATCH_WRITE_LIMIT < total:
+                    await asyncio.sleep(0.3)
+
+        return deleted
+
+    async def cleanup_table(
+        self,
+        app_token: str,
+        table_id: str,
+        keep_days: Optional[int] = None,
+        incoming: int = 0,
+        watermark: int = WATERMARK,
+        protect_today: bool = True,
+        dry_run: bool = False,
+        guard_ratio: float = 0.5,
+    ) -> Dict[str, Any]:
+        """
+        一次全表扫描完成两件事（顺序固定：先按时间、再按容量）：
+
+        1. 按时间清理：删掉 collected_at 早于 keep_days 的记录（keep_days=None 跳过）
+        2. 按容量清理：保证「清理后剩余 + incoming」不超过 watermark，
+           从最旧的记录开始删，腾出空间。
+
+        Args:
+            keep_days: 保留最近多少天；None 表示不做时间维度的清理
+            incoming: 本次准备写入的记录数（写前调用时传入，用于预留空间）
+            watermark: 目标水位线，默认 WATERMARK(14,000)
+            protect_today: 今日采集的数据最后才删。仅当非今日数据不足以腾出空间时，
+                           才会回退删除今日最旧的记录（会在日志中明确告警）。
+            dry_run: 只统计不删除，用于上线前验证清理规模
+            guard_ratio: 时间规则单次删除比例的安全上限（默认 0.5 = 一半）。
+                当 keep_days 规则要删掉的记录超过该比例时，判定为异常
+                （典型场景：采集长期失败 → 全表数据都"过期" → 执行就等于清空历史），
+                此时**跳过时间清理**，只做容量清理。确需执行请显式传 1.0。
+
+        Returns:
+            {
+              "count_before", "count_after", "incoming", "watermark", "limit",
+              "delete_planned", "deleted_by_age", "deleted_by_capacity",
+              "deleted_total", "unparsed", "age_cleanup_skipped",
+              "dry_run", "ok", "message"
+            }
+        """
+        incoming = max(int(incoming or 0), 0)
+
+        rows = await self.scan_records(app_token, table_id)
+        count_before = len(rows)
+
+        # 无采集时间的记录视为最旧（排在最前面），保证任何情况下都能腾出空间。
+        # 但若解析失败率很高，排序就不再可信，必须显著告警，避免误删新数据。
+        parsed = [(parse_record_time(raw), rid) for rid, raw in rows]
+        unparsed = sum(1 for dt, _ in parsed if dt is None)
+        if unparsed:
+            ratio = unparsed / count_before if count_before else 0
+            flag = "🚨" if ratio > 0.1 else "⚠️"
+            print(f"[清理] {flag} {unparsed}/{count_before} 条记录的 collected_at 无法解析"
+                  f"（{ratio:.1%}），这些记录会被当作最旧优先删除。"
+                  f"请确认 collected_at 字段格式是否变更。")
+
+        ordered = sorted(parsed, key=lambda x: x[0] or datetime.min)
+
+        stats: Dict[str, Any] = {
+            "count_before": count_before,
+            "count_after": count_before,
+            "incoming": incoming,
+            "limit": TABLE_RECORD_LIMIT,
+            "watermark": watermark,
+            "deleted_by_age": 0,
+            "deleted_by_capacity": 0,
+            "deleted_total": 0,
+            "delete_planned": 0,
+            "unparsed": unparsed,
+            "age_cleanup_skipped": False,
+            "dry_run": dry_run,
+            "ok": True,
+            "message": "",
+        }
+
+        print(f"[清理] 当前容量: {describe(count_before)}")
+        if count_before >= WARNING:
+            print(f"[清理] ⚠️ 记录数已超过告警水位 {WARNING}，"
+                  f"距硬上限 {TABLE_RECORD_LIMIT} 仅剩 "
+                  f"{TABLE_RECORD_LIMIT - count_before} 条余量")
+
+        to_delete: List[str] = []
+
+        # ---------- 1. 按时间清理 ----------
+        if keep_days is not None:
+            cutoff = datetime.now() - timedelta(days=keep_days)
+            stale = [rid for dt, rid in ordered if dt is not None and dt < cutoff]
+            ratio = len(stale) / count_before if count_before else 0
+
+            if ratio > guard_ratio:
+                # 时间规则要删掉大半张表，几乎总是"采集长期失败、数据整体过期"造成的，
+                # 直接执行等于清空历史。这里拒绝执行，退化为只做容量清理。
+                print(f"[清理] 🚨 按时间规则将删除 {len(stale)}/{count_before} 条"
+                      f"（{ratio:.1%}），超过安全阈值 {guard_ratio:.0%}。"
+                      f"已跳过时间清理，仅执行容量清理。"
+                      f"若确认要清空这些历史数据，请显式传 guard_ratio=1.0（--force）。")
+                stats["age_cleanup_skipped"] = True
+                stale = []
+
+            to_delete.extend(stale)
+            stats["deleted_by_age"] = len(stale)
+            print(f"[清理] 保留最近 {keep_days} 天（截止 {cutoff:%Y-%m-%d %H:%M:%S}），"
+                  f"命中过期记录 {len(stale)} 条")
+
+        # ---------- 2. 按容量清理 ----------
+        remaining_after_age = count_before - len(to_delete)
+        projected = remaining_after_age + incoming
+        # 清理目标：即便算上本次要写入的记录，也不超过水位线
+        keep_target = max(watermark - incoming, 0)
+        excess = remaining_after_age - keep_target
+
+        if excess > 0:
+            already = set(to_delete)
+            pool = [(dt, rid) for dt, rid in ordered if rid not in already]
+
+            if protect_today:
+                today = datetime.now().date()
+                fresh = [rid for dt, rid in pool if dt is not None and dt.date() == today]
+                fresh_set = set(fresh)
+                # 非今日数据（旧→新）优先删除，今日数据（旧→新）兜底
+                delete_order = [rid for _, rid in pool if rid not in fresh_set] + fresh
+            else:
+                fresh_set = set()
+                delete_order = [rid for _, rid in pool]
+
+            extra = delete_order[:excess]
+            to_delete.extend(extra)
+            stats["deleted_by_capacity"] = len(extra)
+
+            spill_today = sum(1 for rid in extra if rid in fresh_set)
+            if spill_today > 0:
+                print(f"[清理] ⚠️ 非今日数据不足以腾出空间，已回退删除 "
+                      f"{spill_today} 条今日记录")
+
+            print(f"[清理] 预计写入 {incoming} 条后共 {projected} 条，超出水位 {watermark}，"
+                  f"追加清理最旧 {len(extra)} 条")
+        else:
+            print(f"[清理] 容量充足（预计 {projected} ≤ 水位 {watermark}），跳过容量清理")
+
+        # ---------- 3. 执行删除 ----------
+        stats["delete_planned"] = len(to_delete)
+        deleted = 0
+
+        if to_delete and dry_run:
+            print(f"[清理] DRY-RUN：计划删除 {len(to_delete)} 条，本次未实际执行")
+            stats["count_after"] = count_before - len(to_delete)
+        elif to_delete:
+            print(f"[清理] 开始删除 {len(to_delete)} 条记录"
+                  f"（每批 {BATCH_WRITE_LIMIT} 条）...")
+            deleted = await self.delete_records(app_token, table_id, to_delete)
+            stats["deleted_total"] = deleted
+            stats["count_after"] = count_before - deleted
+        else:
+            print("[清理] 无需删除任何记录")
+
+        # ---------- 4. 结果判定 ----------
+        if stats["count_after"] + incoming > TABLE_RECORD_LIMIT:
+            stats["ok"] = False
+            stats["message"] = (
+                f"🚨 清理后仍会超限: {stats['count_after']} + {incoming} > "
+                f"{TABLE_RECORD_LIMIT}，需人工介入"
+            )
+        elif dry_run and to_delete:
+            stats["message"] = (
+                f"DRY-RUN 预演: {count_before} → {stats['count_after']} 条"
+                f"（按时间 {stats['deleted_by_age']} 条 + "
+                f"按容量 {stats['deleted_by_capacity']} 条），未实际删除"
+            )
+        else:
+            stats["message"] = (
+                f"清理完成: {count_before} → {stats['count_after']} 条"
+                f"（按时间 {stats['deleted_by_age']} 条 + "
+                f"按容量 {stats['deleted_by_capacity']} 条）"
+            )
+
+        print(f"[清理] {describe(stats['count_after'])} | {stats['message']}")
+        return stats
+
+    async def ensure_capacity(self, app_token: str, table_id: str,
+                              incoming: int = 0,
+                              watermark: int = WATERMARK) -> Dict[str, Any]:
+        """
+        写前容量保障：确保写入 incoming 条记录后表格不超过水位线。
+
+        与 cleanup_table 的区别是只做容量维度、不做时间维度清理，
+        专供采集写入前调用，避免采集任务因 RecordExceedLimit 整体失败。
+        """
+        return await self.cleanup_table(
+            app_token, table_id, keep_days=None, incoming=incoming, watermark=watermark
+        )

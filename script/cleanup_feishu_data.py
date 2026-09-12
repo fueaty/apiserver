@@ -1,13 +1,30 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 飞书多维表格数据清理脚本
-定期清理过期的历史数据，避免表格达到记录上限
+
+被 script/scheduled_cleanup.sh（每日 02:00 cron）调用，因此 CLI 参数保持向后兼容：
+    python script/cleanup_feishu_data.py --days 90 --batch-size 500
+
+与历史版本的区别
+----------------
+旧版本**只按时间清理**（删掉 N 天前的数据）。当表格已经涨到 20,000 条上限时，
+如果这 2 万条都落在保留窗口内，清理一条也删不掉，采集任务继续报：
+
+    RecordExceedLimit（错误码 1254103，单表上限 20,000 条）
+
+现在改为两段式：
+    1. 按时间清理  —— 删除 collected_at 早于 --days 的记录
+    2. 按容量兜底  —— 若清理后仍高于安全水位线，从最旧的记录开始删，压到水位线以内
+
+清理逻辑复用 FeishuService.cleanup_table()，阈值统一来自
+app/services/feishu/limits.py，不再在脚本里写死数字。
 """
 
 import sys
 import os
 import asyncio
-import json
+import argparse
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,155 +32,120 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from app.services.feishu.feishu_service import FeishuService
+from app.services.feishu.limits import describe, WATERMARK, TABLE_RECORD_LIMIT
 from app.core.config import config_manager
 import app.wework.notification_push as notification_push
 
 
-async def cleanup_old_records(days_to_keep: int = 60, batch_size: int = 1000):
+async def cleanup_old_records(days_to_keep=None,
+                              batch_size: int = 500,
+                              table_name: str = "headlines",
+                              dry_run: bool = False,
+                              force: bool = False):
     """
-    清理指定天数之前的旧记录
-    
+    清理过期数据，并保证表格回到安全水位以内。
+
     Args:
-        days_to_keep: 保留的天数，默认60天
-        batch_size: 每批删除的记录数，默认1000条
+        days_to_keep: 保留的天数；None（默认）= 不做时间清理，只按容量清理。
+            ⚠️ 注意：单表上限 20,000 条，按当前约 400 条/天 的采集速率，
+            90 天数据需要约 36,000 条，**在 20,000 条的表里装不下**。
+            因此日常维护应依赖容量清理，慎用大跨度的 --days。
+        batch_size: 保留参数以兼容旧 cron 调用；实际分片大小由飞书接口上限
+                    （BATCH_WRITE_LIMIT = 500，错误码 1254104）决定，此处仅记录。
+        table_name: 目标表名
+        dry_run: 只统计不删除
+        force: 解除时间清理 50% 保护闸（cleanup_table guard_ratio）
     """
     print("=" * 60)
     print("🧹 飞书多维表格数据清理工具")
+    retain = f"{days_to_keep} 天" if days_to_keep is not None else "不限（仅按容量）"
+    print(f"   目标表: {table_name} | 保留: {retain} | "
+          f"水位线: {WATERMARK} | 硬上限: {TABLE_RECORD_LIMIT}")
+    if dry_run:
+        print("   模式: DRY-RUN（只统计，不删除）")
     print("=" * 60)
-    
+
     try:
         # 初始化服务
         print("\n1. 初始化飞书服务...")
         service = FeishuService()
         print("✅ 飞书服务初始化成功")
-        
+
         # 获取配置
         print("\n2. 获取飞书表格配置...")
         creds = config_manager.get_credentials()
-        app_token = creds.get("feishu", {}).get("tables", {}).get("headlines", {}).get("app_token")
-        table_id = creds.get("feishu", {}).get("tables", {}).get("headlines", {}).get("table_id")
-        
+        table_conf = creds.get("feishu", {}).get("tables", {}).get(table_name, {})
+        app_token = table_conf.get("app_token")
+        table_id = table_conf.get("table_id")
+
         if not app_token or not table_id:
-            print("❌ 错误: 未找到飞书配置，请检查 config/credentials.yaml 文件")
+            msg = f"❌ 未找到表 {table_name} 的配置，请检查 config/credentials.yaml"
+            print(msg)
+            notification_push.send_message(msg)
             return False
-            
-        print(f"   App Token: {app_token}")
-        print(f"   Table ID: {table_id}")
-        
-        # 计算截止日期
-        cutoff_date = datetime.now() - timedelta(days=days_to_keep)
-        cutoff_date_str = cutoff_date.strftime("%Y-%m-%d")
+
+        print(f"   App Token: {app_token[:8]}...")
+        print(f"   Table ID:  {table_id}")
+
         print(f"\n3. 清理策略:")
-        print(f"   保留最近 {days_to_keep} 天的数据")
-        print(f"   删除 {cutoff_date_str} 之前的数据")
-        
-        # 获取tenant_access_token
-        print("\n4. 获取访问令牌...")
-        token = await service.get_tenant_access_token()
-        print(f"✅ 成功获取 tenant_access_token")
-        
-        # 查询需要删除的记录
-        print(f"\n5. 查询 {cutoff_date_str} 之前的数据...")
-        records_to_delete = []
-        page_token = None
-        total_checked = 0
-        
-        while True:
-            # 获取一页数据
-            result = await service.list_records(app_token, table_id, page_size=500, page_token=page_token)
-            records = result.get('items', [])
-            
-            if not records:
-                break
-                
-            total_checked += len(records)
-            print(f"   已检查 {total_checked} 条记录...")
-            
-            # 筛选过期记录
-            for record in records:
-                fields = record.get('fields', {})
-                collected_at = fields.get('collected_at', '')
-                
-                if collected_at:
-                    try:
-                        # 解析采集时间
-                        record_date = datetime.fromisoformat(collected_at.split('+')[0])
-                        if record_date.date() < cutoff_date.date():
-                            records_to_delete.append({
-                                "record_id": record['record_id']
-                            })
-                    except Exception as e:
-                        print(f"   ⚠️  解析时间失败: {collected_at}, 错误: {e}")
-            
-            # 获取下一页
-            page_token = result.get('page_token')
-            if not page_token:
-                break
-        
-        print(f"\n6. 清理统计:")
-        print(f"   总检查记录数: {total_checked}")
-        print(f"   需要删除记录数: {len(records_to_delete)}")
-        
-        if len(records_to_delete) == 0:
-            print("✅ 没有过期记录需要清理")
-            notification_push.send_message("✅ 飞书数据清理完成：无过期记录需要清理")
-            return True
-        
-        # 分批删除记录
-        print(f"\n7. 开始删除过期记录...")
-        deleted_count = 0
-        failed_count = 0
-        
-        # 分批处理，避免超出API限制
-        for i in range(0, len(records_to_delete), batch_size):
-            batch = records_to_delete[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (len(records_to_delete) + batch_size - 1) // batch_size
-            
-            print(f"   处理第 {batch_num}/{total_batches} 批，共 {len(batch)} 条记录...")
-            
-            try:
-                # 构造删除请求
-                url = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete"
-                headers = {
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json; charset=utf-8"
-                }
-                delete_data = {"records": batch}
-                
-                # 发送删除请求
-                import httpx
-                async with httpx.AsyncClient() as client:
-                    response = await client.post(url, headers=headers, json=delete_data, timeout=30)
-                    response.raise_for_status()
-                    result = response.json()
-                    
-                    if result.get("code") == 0:
-                        deleted_count += len(batch)
-                        print(f"   ✅ 第 {batch_num} 批删除成功")
-                    else:
-                        failed_count += len(batch)
-                        print(f"   ❌ 第 {batch_num} 批删除失败: {result.get('msg')}")
-                        
-            except Exception as e:
-                failed_count += len(batch)
-                print(f"   ❌ 第 {batch_num} 批删除异常: {e}")
-        
-        print(f"\n8. 清理结果:")
-        print(f"   成功删除: {deleted_count} 条记录")
-        print(f"   删除失败: {failed_count} 条记录")
-        
+        if days_to_keep is not None:
+            cutoff = datetime.now() - timedelta(days=days_to_keep)
+            guard = "已解除(force)" if force else "50%"
+            print(f"   ① 按时间：删除 {days_to_keep} 天前（早于 {cutoff:%Y-%m-%d}）的数据"
+                  f"（保护闸: {guard}）")
+        else:
+            print(f"   ① 按时间：跳过（未指定 --days）")
+        print(f"   ② 按容量：若高于水位线 {WATERMARK}，从最旧的记录开始删到水位线以内")
+        print(f"   （每批 {batch_size} 条，飞书单次写上限 500 条）")
+
+        # 全表扫描 + 两段式清理（一次扫描搞定，避免反复翻页）
+        print(f"\n4. 开始清理...")
+        stats = await service.cleanup_table(
+            app_token,
+            table_id,
+            keep_days=days_to_keep,
+            incoming=0,
+            watermark=WATERMARK,
+            protect_today=True,
+            dry_run=dry_run,
+            guard_ratio=1.0 if force else 0.5,
+        )
+
+        # 输出统计
+        print(f"\n5. 清理统计:")
+        print(f"   清理前: {stats['count_before']} 条  ({describe(stats['count_before'])})")
+        print(f"   清理后: {stats['count_after']} 条  ({describe(stats['count_after'])})")
+        if stats.get("age_cleanup_skipped"):
+            print(f"   🚨 时间清理已被保护闸拦截（本次未按 --days 删除）")
+        print(f"   按时间删除: {stats['deleted_by_age']} 条")
+        print(f"   按容量删除: {stats['deleted_by_capacity']} 条")
+        print(f"   计划删除合计: {stats['delete_planned']} 条")
+        if not dry_run:
+            print(f"   实际删除: {stats['deleted_total']} 条")
+            failed = stats['delete_planned'] - stats['deleted_total']
+            if failed:
+                print(f"   ⚠️ 删除失败: {failed} 条（详见上方 [ERROR] 日志）")
+
         # 发送通知
-        msg = f"🧹 飞书数据清理完成\n成功删除: {deleted_count} 条记录\n删除失败: {failed_count} 条记录"
+        prefix = "🧪" if dry_run else ("✅" if stats["ok"] else "🚨")
+        header = "容量预演" if dry_run else "数据清理完成"
+        guard_note = "\n🚨 时间清理被保护闸拦截" if stats.get("age_cleanup_skipped") else ""
+        msg = (
+            f"{prefix} 飞书{header}: {table_name}\n"
+            f"清理前: {stats['count_before']} 条\n"
+            f"清理后: {stats['count_after']} 条\n"
+            f"删除: {stats['deleted_total'] if not dry_run else stats['delete_planned']} 条\n"
+            f"状态: {describe(stats['count_after'])}{guard_note}"
+        )
         notification_push.send_message(msg)
-        print(f"📤 通知已发送")
-        
+        print("📤 通知已发送")
+
         print("\n" + "=" * 60)
-        print("✅ 数据清理完成!")
+        print(f"{prefix} {stats['message']}")
         print("=" * 60)
-        
-        return failed_count == 0
-        
+
+        return stats["ok"]
+
     except Exception as e:
         error_msg = f"❌ 数据清理过程中发生错误: {e}"
         print(error_msg)
@@ -171,7 +153,7 @@ async def cleanup_old_records(days_to_keep: int = 60, batch_size: int = 1000):
         traceback.print_exc()
         try:
             notification_push.send_message(error_msg)
-        except:
+        except Exception:
             pass
         return False
 
@@ -179,29 +161,28 @@ async def cleanup_old_records(days_to_keep: int = 60, batch_size: int = 1000):
 def backup_deleted_data(days_to_keep: int = 60):
     """
     备份即将删除的数据到本地文件
-    
-    Args:
-        days_to_keep: 保留的天数
+
+    注意：当前版本仅记录删除操作，实际数据备份需要额外实现。
     """
     print("\n📝 备份即将删除的数据...")
-    
+
     try:
-        # 计算截止日期
         cutoff_date = datetime.now() - timedelta(days=days_to_keep)
         cutoff_date_str = cutoff_date.strftime("%Y-%m-%d")
-        
-        # 创建备份目录
+
         backup_dir = Path("../backup/deleted_data")
         backup_dir.mkdir(parents=True, exist_ok=True)
-        
-        # 生成备份文件名
-        backup_file = backup_dir / f"deleted_before_{cutoff_date_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        
+
+        backup_file = backup_dir / (
+            f"deleted_before_{cutoff_date_str}_"
+            f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+
         print(f"   备份文件: {backup_file}")
         print("   ⚠️  注意: 当前版本仅记录删除操作，实际数据备份需要额外实现")
-        
+
         return True
-        
+
     except Exception as e:
         print(f"   ❌ 备份过程出错: {e}")
         return False
@@ -209,29 +190,38 @@ def backup_deleted_data(days_to_keep: int = 60):
 
 async def main():
     """主函数"""
-    import argparse
-    
     parser = argparse.ArgumentParser(description="飞书多维表格数据清理工具")
-    parser.add_argument("--days", type=int, default=60, 
-                       help="保留天数 (默认: 60天)")
-    parser.add_argument("--batch-size", type=int, default=1000,
-                       help="每批删除记录数 (默认: 1000条)")
+    parser.add_argument("--days", type=int, default=None,
+                        help="保留天数。不传（默认）= 不做时间清理，只按容量清理。"
+                             "注意：单表上限 20000 条，按约 400 条/天 的速率，"
+                             "90 天数据需约 36000 条，装不下，慎用大跨度 --days")
+    parser.add_argument("--batch-size", type=int, default=500,
+                        help="每批删除记录数 (默认: 500，飞书单次写上限 500，传更大值无效)")
+    parser.add_argument("--table", type=str, default="headlines",
+                        help="目标表名，对应 credentials.yaml 中 feishu.tables 的键")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="只统计不删除")
+    parser.add_argument("--force", action="store_true",
+                        help="解除时间清理的 50%% 保护闸（确认要按 --days 清空历史数据时才用）")
     parser.add_argument("--backup", action="store_true",
-                       help="执行数据备份")
-    
+                        help="执行数据备份")
+
     args = parser.parse_args()
-    
-    # 执行备份（如果需要）
+
     if args.backup:
-        backup_deleted_data(args.days)
-    
-    # 执行清理
-    success = await cleanup_old_records(args.days, args.batch_size)
-    
+        backup_deleted_data(args.days or 90)
+
+    success = await cleanup_old_records(
+        days_to_keep=args.days,
+        batch_size=args.batch_size,
+        table_name=args.table,
+        dry_run=args.dry_run,
+        force=args.force,
+    )
+
     return 0 if success else 1
 
 
 if __name__ == "__main__":
     result = asyncio.run(main())
     sys.exit(result)
-
