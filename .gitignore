@@ -56,6 +56,9 @@ Thumbs.db
 # 忽略Docker构建缓存
 .docker/
 
+# 忽略 WorkBuddy 工作目录（临时对比副本、记忆文件等）
+.workbuddy/
+
 # 确保保留示例文件
 !config/credentials.yaml.example
 !secret/auth_key.json.example
