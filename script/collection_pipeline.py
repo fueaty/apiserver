@@ -253,6 +253,16 @@ async def test_collection_pipeline():
             # 检查插入结果
             if result.get("code") == 0:
                 record_count = len(result.get("data", {}).get("records", []))
+                # 闭环检测：送出 N vs 写入 M。差额 = 被 FeishuService._align_records_with_fields
+                # 丢弃的条数（形状不符）或分片写入失败的条数。历史 bug 正是
+                # 「送出 329 / 写入 227 / 差额 102 ≈ thepaper 全部」被当成正常成功。
+                sent_count = len(records_to_create)
+                diff = sent_count - record_count
+                if diff > 0:
+                    gap_msg = (f"⚠️ 采集写入差额：送出 {sent_count} 条 / 写入 {record_count} 条 "
+                               f"/ 差额 {diff} 条（疑似形状不符被丢弃，见对齐告警日志）")
+                    notification_push.send_message(gap_msg)
+                    print(gap_msg)
                 msg = f"✅ 采集任务执行成功，更新 {record_count} 条记录到飞书多维表格"
                 notification_push.send_message(msg)
                 print(msg)

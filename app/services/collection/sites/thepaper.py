@@ -133,7 +133,14 @@ class ThepaperSite(BaseSite):
         # 异常会被上面的 except 吞掉；若不在此处兜底，就会返回**未经截断的全量列表**。
         # MAX_RESULTS 是 limits.py 容量预算里 thepaper 的硬上界（DAILY_BUDGET 的输入），
         # 「被守卫依赖的上界」不能带“异常时静默失效”的分支，故 return 前必定再截一次。
-        return results[:MAX_RESULTS]
+        #
+        # ⚠️ 返回前**必须**包装成 {"fields": item}：这是飞书批写层
+        #    FeishuService._align_records_with_fields 要求的对象形状，该函数对
+        #    「缺 'fields' 键」的记录直接 `continue` 跳过（feishu_service.py:305）。
+        #    其余 8 个站点（baidu/cctv/people_daily/tech_36kr/weibo/xiaohongshu/zhihu/xinhua）
+        #    返回前都做了这层包装，thepaper 此前**漏了它** → 采集到 100 条却「入库 0 条」
+        #    （被静默丢弃，无任何日志）。顺序：先按 MAX_RESULTS 截断，再逐条包装（幂等）。
+        return [{"fields": item} for item in results[:MAX_RESULTS]]
     
     def _parse_category_page(self, html_text: str, category_url: str) -> List[Dict[str, Any]]:
         """解析澎湃新闻分类页面内容"""

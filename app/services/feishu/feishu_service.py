@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 import lark_oapi as lark
 from lark_oapi.api.bitable.v1 import *
 from ...core.config import config_manager
+from ...utils.logger import logger
 from .field_rules import BASE_FIELD_DEFINITIONS, REQUIRED_FIELDS
 from .limits import (
     TABLE_RECORD_LIMIT,
@@ -301,9 +302,18 @@ class FeishuService:
         """
         aligned_records = []
         
+        dropped_count = 0
+        dropped_keys_samples = []
+
         for record in records:
             if "fields" not in record:
-                # 如果记录没有fields字段，跳过该记录
+                # 如果记录没有fields字段，跳过该记录（计数后循环外统一告警，不得静默）
+                dropped_count += 1
+                if len(dropped_keys_samples) < 5:
+                    if isinstance(record, dict):
+                        dropped_keys_samples.append(list(record.keys()))
+                    else:
+                        dropped_keys_samples.append(type(record).__name__)
                 continue
                 
             # 只保留表格中存在的字段
@@ -318,6 +328,13 @@ class FeishuService:
                 "fields": aligned_fields
             })
             
+        if dropped_count:
+            logger.warning(
+                "对齐丢弃 %d/%d 条记录：缺少 'fields' 键（该批不会入库、且此前不报错）。"
+                "被丢记录键名样例: %s。请检查采集器返回形状是否为 {'fields': item}。",
+                dropped_count, len(records), dropped_keys_samples,
+            )
+
         return aligned_records
 
     async def ensure_table_fields(self, app_token: str, table_id: str, required_fields: Optional[Set[str]] = None, table_name: str = "") -> Tuple[bool, str]:
