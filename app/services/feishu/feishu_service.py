@@ -607,18 +607,48 @@ class FeishuService:
               规避 1254291 Write conflict。**单分片失败不中断后续分片**。
         令牌：``await self.get_tenant_access_token()``（与既有方法一致）。
         """
-        # 规范化：仅保留携带 record_id 的对象
+        # 规范化：仅保留携带 record_id 的对象。
+        # ⚠️ 写路径上「形状不符 → 静默跳过」的同族残留（对齐层已加丢弃告警，这里补齐）：
+        # 被丢条数/样例必须可观测，否则调用方会把「全被丢光」误读成「全部更新成功」。
+        # 触发条件是**编程错误**（误用 batch_add 的 {'fields': item} 形状 / record_id 拼错），
+        # 与采集形状无关，但若不报错就会静默漏更新。
+        total_input = len(records) if isinstance(records, (list, tuple)) else 0
+        dropped_count = 0
+        dropped_samples: List[Any] = []
         normalized: List[Dict[str, Any]] = []
         for rec in records or []:
             if not isinstance(rec, dict):
+                dropped_count += 1
+                if len(dropped_samples) < 5:
+                    dropped_samples.append(type(rec).__name__)
                 continue
             record_id = rec.get("record_id")
             if not record_id:
+                dropped_count += 1
+                if len(dropped_samples) < 5:
+                    dropped_samples.append(list(rec.keys()))
                 continue
             fields = rec.get("fields") or {}
             normalized.append({"record_id": record_id, "fields": fields})
 
+        if dropped_count:
+            logger.warning(
+                "batch_update 规范化丢弃 %d/%d 条记录：非 dict 或缺少 record_id"
+                "（该批不会被更新、且此前不报错）。被丢记录样例: %s。"
+                "请检查调用方是否误用了 batch_add 的 {'fields': item} 形状。",
+                dropped_count, total_input, dropped_samples,
+            )
+
         if not normalized:
+            # 归一化后为空：此前直接返回 success(0)，调用方无法区分
+            # 「确实没有要更新的」与「传进来的全被丢光」——补一条可观测输出。
+            if dropped_count:
+                logger.warning(
+                    "batch_update 归一化后为空：输入 %d 条全部被丢弃（无一条携带 record_id），"
+                    "返回 success(0)。调用方请确认传入的是 "
+                    "[{'record_id': ..., 'fields': {...}}, ...]。",
+                    total_input,
+                )
             return {"code": 0, "msg": "success", "data": {"records": [], "updated": 0}}
 
         token = await self.get_tenant_access_token()

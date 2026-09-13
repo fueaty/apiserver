@@ -262,11 +262,19 @@ async def test_collection_pipeline():
                 if title in title_to_record_ids:
                     # 标题已存在，需要删除已存在的记录
                     records_to_delete.append(title_to_record_ids[title][0])
-        
+
+        # 去重（QA 报的「无法闭合 +5 残差」最可能成因）：当多个入站记录共享同一 title 时，
+        # `title_to_record_ids[title][0]` 会被 append **多次** → 删除接口收到重复 id；
+        # 而此处/下方「需要删除 N / 成功 N/N」用的是**列表长度**而非**唯一 id 数**，
+        # 导致对账（如 983−189=794）无法闭合。按首次出现顺序去重，两个数都留痕。
+        delete_len_raw = len(records_to_delete)
+        records_to_delete = list(dict.fromkeys(records_to_delete))
+
         # 所有记录都需要重新创建（无论是新记录还是替换的记录）
         records_to_create = feishu_records
-        
-        print(f"   需要删除 {len(records_to_delete)} 条已存在记录")
+
+        print(f"   需要删除 {delete_len_raw} 条已存在记录"
+              f"（去重后唯一 {len(records_to_delete)} 个 id）")
         print(f"   需要创建 {len(records_to_create)} 条记录（包括新记录和替换的记录）")
         
         # 批量删除已存在的记录
