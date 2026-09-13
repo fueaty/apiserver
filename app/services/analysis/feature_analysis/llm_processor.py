@@ -5,6 +5,9 @@ import asyncio
 from datetime import datetime
 
 from ....core.config import config_manager
+# 需求③：LLM 客户端迁入 llm_clients.py，这里 re-export LLMMockClient 以保持向后兼容
+# （全仓唯一引用点在本文件的迁移前实现，迁移是安全的）。
+from .llm_clients import LLMMockClient, build_llm_client  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -21,20 +24,31 @@ class LLMProcessor:
         self.temperature = self.llm_config.get('temperature', 0.3)
         self.max_tokens = self.llm_config.get('max_tokens', 2000)
         
-        # 初始化大模型客户端
+        # 初始化大模型客户端（需求③：可插拔，无 Key 自动降级为 Mock）
         self.llm_client = self._initialize_llm_client()
-    
+
     def _initialize_llm_client(self):
         """
-        初始化大模型客户端
-        
+        初始化大模型客户端（需求③：按 Key 有无选择 real / mock）。
+
+        真实 Key 只从 ``config/credentials.yaml`` 的 ``llm`` 段读取；无 Key 时工厂
+        返回 ``LLMMockClient``，链路与离线测试仍可跑通。模式存入 ``self.llm_client_mode``。
+
         Returns:
             大模型客户端实例
         """
-        # 这里根据不同的provider初始化不同的客户端
-        # 目前返回一个模拟客户端，实际实现时需要替换为真实的SDK调用
-        logger.info(f"初始化大模型客户端: {self.provider} - {self.model_name}")
-        return LLMMockClient(provider=self.provider, model_name=self.model_name)
+        creds = config_manager.get_credentials().get('llm', {}) or {}
+        api_key = creds.get('api_key')
+        base_url = self.llm_config.get('base_url') or creds.get('base_url')
+        timeout = self.llm_config.get('timeout', 30)
+
+        client, mode = build_llm_client(
+            self.provider, self.model_name, base_url, api_key, timeout
+        )
+        self.llm_client_mode = mode
+        logger.info("初始化大模型客户端: %s - %s (mode=%s)",
+                    self.provider, self.model_name, mode)
+        return client
     
     async def analyze_hotspot(self, hotspot: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -292,83 +306,5 @@ class LLMProcessor:
         return 5  # 默认评分
 
 
-class LLMMockClient:
-    """
-    大模型客户端的模拟实现
-    实际使用时需要替换为真实的API调用
-    """
-    
-    def __init__(self, provider: str = 'openai', model_name: str = 'gpt-4-turbo'):
-        self.provider = provider
-        self.model_name = model_name
-        logger.info(f"创建模拟大模型客户端: {provider} - {model_name}")
-    
-    async def generate(self, prompt: str, temperature: float = 0.7, max_tokens: int = 1000) -> str:
-        """
-        异步生成文本
-        """
-        # 模拟延迟
-        await asyncio.sleep(1)
-        
-        # 模拟返回结果
-        return self._mock_response(prompt)
-    
-    def generate_sync(self, prompt: str, temperature: float = 0.7, max_tokens: int = 1000) -> str:
-        """
-        同步生成文本
-        """
-        # 模拟延迟
-        import time
-        time.sleep(0.5)
-        
-        # 模拟返回结果
-        return self._mock_response(prompt)
-    
-    def _mock_response(self, prompt: str) -> str:
-        """
-        生成模拟响应
-        """
-        # 根据提示内容生成不同的模拟响应
-        if '请对以下新闻热点进行全面分析' in prompt:
-            # 提取标题信息
-            import re
-            title_match = re.search(r'【热点标题】\n(.*?)\n', prompt)
-            title = title_match.group(1) if title_match else '未知标题'
-            
-            # 模拟分析结果
-            mock_result = {
-                "entities": [
-                    {
-                        "name": "示例实体1",
-                        "type": "组织",
-                        "importance": "高"
-                    },
-                    {
-                        "name": "示例实体2",
-                        "type": "人物",
-                        "importance": "中"
-                    }
-                ],
-                "keywords": [
-                    {
-                        "word": "关键词1",
-                        "relevance": 5
-                    },
-                    {
-                        "word": "关键词2",
-                        "relevance": 4
-                    }
-                ],
-                "sentiment": "中性",
-                "title_attractiveness": 7,
-                "virality_score": 6,
-                "topic_category": "科技",
-                "sub_category": "AI",
-                "summary": f"关于{title}的热点新闻分析",
-                "potential_impact": "中"
-            }
-            
-            return json.dumps(mock_result, ensure_ascii=False)
-        
-        # 默认响应
-        return "这是一个模拟响应"
+# 说明：原 ``LLMMockClient`` 已迁至 ``.llm_clients``（需求③），并在本文件顶部 re-export，
+# 以保证 ``from ...llm_processor import LLMMockClient`` 的既有引用不中断。

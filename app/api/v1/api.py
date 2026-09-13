@@ -3,7 +3,10 @@ API路由配置
 """
 
 from fastapi import APIRouter
-from app.api.v1.endpoints import auth, collection, publication, selection, tasks, feishu, analysis, enhanced_collection
+from app.api.v1.endpoints import (
+    auth, collection, publication, selection, tasks, feishu,
+    analysis, enhanced_collection, content, insights,
+)
 
 
 # 创建API路由器
@@ -33,3 +36,9 @@ api_router.include_router(analysis.router, prefix="/analysis", tags=["效果分�
 
 # 注册增强采集路由
 api_router.include_router(enhanced_collection.router, prefix="/enhanced", tags=["增强采集"])
+
+# 注册正文采集路由（需求②）—— 前缀 /collection，端点内为 /content/fetch、/content/backfill
+api_router.include_router(content.router, prefix="/collection", tags=["正文采集"])
+
+# 注册 ai_insights 深度内容路由（需求③）—— 前缀 /analysis，端点内为 /insights/generate、/insights/preflight
+api_router.include_router(insights.router, prefix="/analysis", tags=["深度内容"])
