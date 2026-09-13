@@ -27,6 +27,7 @@ import importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ANALYSIS_DIR = os.path.join(ROOT, "app", "services", "analysis")
 FA_DIR = os.path.join(ANALYSIS_DIR, "feature_analysis")
+FEISHU_DIR = os.path.join(ROOT, "app", "services", "feishu")
 
 # ---------------------------------------------------------------------------
 # 1. 第三方依赖桩
@@ -35,6 +36,16 @@ httpx_stub = types.ModuleType("httpx")
 httpx_stub.AsyncClient = object
 httpx_stub.Client = object
 sys.modules["httpx"] = httpx_stub
+
+lark_stub = types.ModuleType("lark_oapi")
+lark_stub.__path__ = []
+lark_stub.LogLevel = types.SimpleNamespace(INFO=1, DEBUG=2)
+sys.modules["lark_oapi"] = lark_stub
+for name in ("lark_oapi.api", "lark_oapi.api.bitable", "lark_oapi.api.bitable.v1"):
+    m = types.ModuleType(name)
+    m.__path__ = []
+    sys.modules[name] = m
+sys.modules["lark_oapi.api.bitable.v1"].__dict__["*"] = None
 
 for name, path in (
     ("app", os.path.join(ROOT, "app")),
@@ -45,6 +56,7 @@ for name, path in (
     ("app.services.analysis.feature_analysis", FA_DIR),
     ("app.services.analysis.classification", os.path.join(ANALYSIS_DIR, "classification")),
     ("app.services.analysis.storage", os.path.join(ANALYSIS_DIR, "storage")),
+    ("app.services.feishu", FEISHU_DIR),
 ):
     m = types.ModuleType(name)
     m.__path__ = [path]
@@ -76,6 +88,12 @@ llm_clients = _load("app.services.analysis.feature_analysis.llm_clients",
                     os.path.join(FA_DIR, "llm_clients.py"))
 llm_processor = _load("app.services.analysis.feature_analysis.llm_processor",
                       os.path.join(FA_DIR, "llm_processor.py"))
+
+# feature_analysis 包现以“严格导入”方式依赖 feishu_data_loader -> feishu_service，
+# 后者需要 lark_oapi 桩与 feishu 包骨架；此处先行装载，保证包 import 不受影响。
+_load("app.services.feishu.limits", os.path.join(FEISHU_DIR, "limits.py"))
+_load("app.services.feishu.field_rules", os.path.join(FEISHU_DIR, "field_rules.py"))
+_load("app.services.feishu.feishu_service", os.path.join(FEISHU_DIR, "feishu_service.py"))
 
 PASSED = []
 FAILED = []

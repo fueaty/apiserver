@@ -115,9 +115,11 @@ def build_insight_fields(headline: Dict[str, Any],
 
     summary = _as_text(llm_out.get('summary'))
 
-    # content：优先用 headline.content；为空则退化为 title + '\n' + summary
+    # content：优先用 headline.content；**仅在 summary 非空时**退化为 title + '\n' + summary。
+    # 若 summary 也为空则明确置空——否则 content 会恰好等于 title（非空字符串），
+    # 下游将无法区分“有正文”与“没正文”，等于用兜底掩盖了数据缺失。
     content = _as_text(headline.get('content'))
-    if not content:
+    if not content and summary:
         content = (title + '\n' + summary).strip()
 
     # category：LLM 生成优先（仅当在 generate_set 且非空），否则回退 headline.category

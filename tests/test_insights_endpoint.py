@@ -288,7 +288,7 @@ def run():
     r0 = resp["data"]["results"][0]
     check("该条 failed", r0["status"] == "failed", r0["status"])
     check("error_code=TABLE_SCHEMA_UNCONFIRMED",
-          r0["error_code"] == TABLE_SCHEMA_UNCONFIRMED, r0["error_code"])
+          r0.get("error_code") == TABLE_SCHEMA_UNCONFIRMED, r0.get("error_code"))
     check("未写入", resp["data"]["written"] == 0, resp["data"]["written"])
     check("未调用 batch_add_records", fake.added == [], fake.added)
 
