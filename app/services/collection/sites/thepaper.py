@@ -11,14 +11,20 @@ from .base import BaseSite
 from ....utils.id_generator import generate_content_id
 
 
-# 单轮采集返回的最大条数（容量约束，唯一事实来源）。
+# 单轮采集返回的最大条数（容量约束）。
 #
-# ⚠️ 本值参与飞书容量预算：app/services/feishu/limits.py 的 DAILY_BUDGET
-#    （630 条/天）按「thepaper 每轮最多 MAX_RESULTS 条 × 2 轮/天 = 200 条」计入，
-#    是本项目容量模型里 thepaper 的硬上界。若调大此值，必须同步复核
-#    limits.DAILY_BUDGET 与 limits.WATERMARK，否则 limits.py 在 import 期执行的
-#    容量守卫（RETENTION_DAYS × DAILY_BUDGET ≤ WATERMARK）会直接 raise ValueError
-#    ——因为保留窗口在 20,000 条的硬上限表里会装不下。
+# ⚠️ 本值是容量模型里 thepaper 的硬上界，但**当前没有任何代码校验它**：
+#    app/services/feishu/limits.py 的 _assert_capacity_budget() 只对 limits.py
+#    自己的 5 个常量做算术（RETENTION_DAYS × DAILY_BUDGET ≤ WATERMARK），
+#    **从不读取站点模块**（limits.py 里一个 import 都没有）。
+#    实测（2026-09-14，隔离副本）：把本值改成 9999，7 个测试套件全绿、
+#    import 期守卫也不 raise；全仓也没有任何地方校验 Σ(各站上限) 与 DAILY_BUDGET 的关系。
+#
+# ⇒ 调大本值 = 一次**静默的容量预算突破**，不会有任何报错拦住你。若确要调大，
+#    必须**手工**同步复核 limits.DAILY_BUDGET 与 limits.WATERMARK；否则保留窗口会在
+#    20,000 条的硬上限表里被容量段压缩（详见 2026-09-14 的验证记录）。
+#    真正会 raise 的只有一种情况：直接改 limits.py 的常量、把
+#    RETENTION_DAYS × DAILY_BUDGET 顶过 WATERMARK。
 MAX_RESULTS = 100
 
 
@@ -131,7 +137,8 @@ class ThepaperSite(BaseSite):
         #   results.sort(key=lambda x: int(x.get('hot', 0))) 遇到非数字 hot → ValueError，或
         #   item['hot'] 缺键 → KeyError，
         # 异常会被上面的 except 吞掉；若不在此处兜底，就会返回**未经截断的全量列表**。
-        # MAX_RESULTS 是 limits.py 容量预算里 thepaper 的硬上界（DAILY_BUDGET 的输入），
+        # 容量模型按本值（MAX_RESULTS）计入 DAILY_BUDGET，但**无任何代码校验**
+        # （见模块顶部 MAX_RESULTS 注释），
         # 「被守卫依赖的上界」不能带“异常时静默失效”的分支，故 return 前必定再截一次。
         #
         # ⚠️ 返回前**必须**包装成 {"fields": item}：这是飞书批写层
