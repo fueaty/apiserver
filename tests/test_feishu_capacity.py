@@ -171,20 +171,20 @@ def test_capacity_cleanup():
     original = make_rows(19000)
     svc = FakeFeishu(original)
     stats = asyncio.run(svc.cleanup_table("t", "id", keep_days=None, incoming=0))
-    expected_delete = 19000 - WATERMARK          # 5000
+    expected_delete = 19000 - WATERMARK          # 2000（WATERMARK=17000）
     check("删除量正确", stats["deleted_total"] == expected_delete,
           f"expect={expected_delete} got={stats['deleted_total']}")
     check("删到水位", stats["count_after"] == WATERMARK, stats["count_after"])
     check("ok=True", stats["ok"] is True)
 
-    # 删除的必须是「最旧的 5000 条」，剩余必须是「最新的 14000 条」
+    # 删除的必须是「最旧的 expected_delete 条」，剩余必须是「最新的 WATERMARK 条」
     ordered = sorted(original, key=lambda r: r[1])
     expected_deleted = {rid for rid, _ in ordered[:expected_delete]}
     expected_remaining = {rid for rid, _ in ordered[expected_delete:]}
     actual_deleted = set(svc.deleted_batches[0]) if svc.deleted_batches else set()
-    check("删除集合 = 最旧 5000 条", actual_deleted == expected_deleted,
+    check("删除集合 = 最旧 expected_delete 条", actual_deleted == expected_deleted,
           f"len={len(actual_deleted)} diff={len(actual_deleted ^ expected_deleted)}")
-    check("剩余集合 = 最新 14000 条",
+    check("剩余集合 = 最新 WATERMARK 条",
           {r[0] for r in svc.rows} == expected_remaining,
           f"len={len(svc.rows)}")
 
@@ -193,7 +193,7 @@ def test_capacity_with_incoming():
     print("\n[4] 预留写入空间（incoming 参与水位计算）")
     svc = FakeFeishu(make_rows(19000))
     stats = asyncio.run(svc.cleanup_table("t", "id", keep_days=None, incoming=2000))
-    expect_after = WATERMARK - 2000               # 12000
+    expect_after = WATERMARK - 2000               # 15000（WATERMARK=17000）
     check("清理后 = 水位 - incoming", stats["count_after"] == expect_after,
           f"expect={expect_after} got={stats['count_after']}")
     check("ok=True", stats["ok"] is True)
@@ -224,7 +224,7 @@ def test_dry_run():
     stats = asyncio.run(svc.cleanup_table("t", "id", keep_days=None, incoming=0, dry_run=True))
     check("未下发删除", svc.deleted_batches == [], svc.deleted_batches)
     check("实际删除 0", stats["deleted_total"] == 0)
-    check("计划删除量正确", stats["delete_planned"] == 5000, stats["delete_planned"])
+    check("计划删除量正确", stats["delete_planned"] == 19000 - WATERMARK, stats["delete_planned"])
     check("预计剩余正确", stats["count_after"] == WATERMARK, stats["count_after"])
     check("标记 dry_run", stats["dry_run"] is True)
 

@@ -32,7 +32,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from app.services.feishu.feishu_service import FeishuService
-from app.services.feishu.limits import describe, WATERMARK, TABLE_RECORD_LIMIT
+from app.services.feishu.limits import (
+    describe, WATERMARK, TABLE_RECORD_LIMIT, RETENTION_DAYS,
+)
 from app.core.config import config_manager
 import app.wework.notification_push as notification_push
 
@@ -46,10 +48,12 @@ async def cleanup_old_records(days_to_keep=None,
     清理过期数据，并保证表格回到安全水位以内。
 
     Args:
-        days_to_keep: 保留的天数；None（默认）= 不做时间清理，只按容量清理。
-            ⚠️ 注意：单表上限 20,000 条，按当前约 400 条/天 的采集速率，
-            90 天数据需要约 36,000 条，**在 20,000 条的表里装不下**。
-            因此日常维护应依赖容量清理，慎用大跨度的 --days。
+        days_to_keep: 保留的天数；None = 不做时间清理，只按容量清理。
+            CLI 的 --days 默认值取自 limits.RETENTION_DAYS（当前 25 天），
+            cron（scheduled_cleanup.sh）不再显式传参，直接依赖该默认值。
+            ⚠️ 注意：单表上限 20,000 条，按当前约 630 条/天 的采集速率，
+            90 天数据需要约 56,700 条，**在 20,000 条的表里装不下**。
+            因此不要盲目放大 --days（保留窗口的唯一事实来源是 limits.RETENTION_DAYS）。
         batch_size: 保留参数以兼容旧 cron 调用；实际分片大小由飞书接口上限
                     （BATCH_WRITE_LIMIT = 500，错误码 1254104）决定，此处仅记录。
         table_name: 目标表名
@@ -191,10 +195,13 @@ def backup_deleted_data(days_to_keep: int = 60):
 async def main():
     """主函数"""
     parser = argparse.ArgumentParser(description="飞书多维表格数据清理工具")
-    parser.add_argument("--days", type=int, default=None,
-                        help="保留天数。不传（默认）= 不做时间清理，只按容量清理。"
-                             "注意：单表上限 20000 条，按约 400 条/天 的速率，"
-                             "90 天数据需约 36000 条，装不下，慎用大跨度 --days")
+    parser.add_argument("--days", type=int, default=RETENTION_DAYS,
+                        help="保留天数。默认取自 limits.RETENTION_DAYS"
+                             "（当前 %d 天）；显式传 None 无法通过 CLI 实现，"
+                             "若只想做容量清理可在代码里以 days_to_keep=None 调用。"
+                             "注意：单表上限 20000 条，按约 630 条/天 的速率，"
+                             "90 天数据需约 56700 条，装不下，不要盲目放大 --days"
+                             % RETENTION_DAYS)
     parser.add_argument("--batch-size", type=int, default=500,
                         help="每批删除记录数 (默认: 500，飞书单次写上限 500，传更大值无效)")
     parser.add_argument("--table", type=str, default="headlines",

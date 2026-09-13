@@ -11,6 +11,17 @@ from .base import BaseSite
 from ....utils.id_generator import generate_content_id
 
 
+# 单轮采集返回的最大条数（容量约束，唯一事实来源）。
+#
+# ⚠️ 本值参与飞书容量预算：app/services/feishu/limits.py 的 DAILY_BUDGET
+#    （630 条/天）按「thepaper 每轮最多 MAX_RESULTS 条 × 2 轮/天 = 200 条」计入，
+#    是本项目容量模型里 thepaper 的硬上界。若调大此值，必须同步复核
+#    limits.DAILY_BUDGET 与 limits.WATERMARK，否则 limits.py 在 import 期执行的
+#    容量守卫（RETENTION_DAYS × DAILY_BUDGET ≤ WATERMARK）会直接 raise ValueError
+#    ——因为保留窗口在 20,000 条的硬上限表里会装不下。
+MAX_RESULTS = 100
+
+
 class ThepaperSite(BaseSite):
     """澎湃新闻热点采集"""
     
@@ -104,8 +115,8 @@ class ThepaperSite(BaseSite):
                     item['rank'] = str(i)
                     # 动态调整热度值，确保排名高的新闻热度更高
                     item['hot'] = str(max(50000, int(item['hot']), 200000 - (i - 1) * 500))
-                # 限制返回最多100条数据
-                results = results[:100]
+                # 限制返回最多 MAX_RESULTS 条数据（容量约束，见模块顶部 MAX_RESULTS）
+                results = results[:MAX_RESULTS]
                     
         except Exception as e:
             # 请求失败时记录错误

@@ -13,7 +13,7 @@ import os
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.services.collection.sites.thepaper import ThepaperSite
+from app.services.collection.sites.thepaper import ThepaperSite, MAX_RESULTS
 
 async def test_thepaper_collection():
     """测试澎湃新闻热榜采集功能"""
@@ -53,6 +53,14 @@ async def test_thepaper_collection():
                     valid_count += 1
             
             print(f"有效数据: {valid_count}/{len(results)} 条")
+
+            # 容量约束：collect() 返回的条数不得超过模块常量 MAX_RESULTS
+            # （该常量参与 limits.py 的容量预算，见 thepaper.py 顶部说明）
+            print(f"容量上限校验: MAX_RESULTS = {MAX_RESULTS}")
+            if len(results) <= MAX_RESULTS:
+                print(f"条数校验: {len(results)} <= MAX_RESULTS({MAX_RESULTS}) [OK]")
+            else:
+                print(f"条数校验: {len(results)} > MAX_RESULTS({MAX_RESULTS}) [FAIL]")
             
             # 检查热度值是否正确排序
             hot_values = [int(item['hot']) for item in results if 'hot' in item and item['hot'].isdigit()]
