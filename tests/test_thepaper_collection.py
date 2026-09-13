@@ -7,7 +7,12 @@
 包含两部分：
   1) 离线截断守卫断言（默认执行、不联网）：证明 collect() 在“排序/排名分支抛异常
      被 except 吞掉”时，返回结果仍被无条件截断到 MAX_RESULTS（补⑥ 回归）；
-  2) 端到端网络采集（加 --e2e 才执行）：需要外网与真实站点。
+  2) 端到端网络采集（加 --e2e 才执行）：需要外网与真实 aiohttp；判定为**真断言**
+     （空跑 len==0 / 超 MAX_RESULTS / 落盘异常 均置 FAIL，影响退出码）。
+
+aiohttp 采用**条件桩**：依赖齐全时用真实包（--e2e 才真能联网），
+仅当 ImportError 时才补桩（使未装依赖的干净环境也能直跑离线断言）。
+见下方“依赖桩”块内的合法性判据说明。
 
     python tests/test_thepaper_collection.py            # 只跑离线断言
     python tests/test_thepaper_collection.py --e2e      # 额外跑真实采集
@@ -25,13 +30,28 @@ import types
 # thepaper → .base 在**模块级** `import aiohttp`，且 base.get_session 的类型注解
 # `-> aiohttp.ClientSession` 会在 def 时求值 → 即使本测试全程走桩 session，
 # 模块导入本身也需要 aiohttp 这个"名字"存在。
-# 这里**无条件**打桩（不要 try/except 真实 import），使本测试在
-# **未安装项目依赖的干净环境也能直跑** —— 复现性优先于复用真实包。
-_aiohttp_stub = types.ModuleType("aiohttp")
-_aiohttp_stub.ClientSession = object
-_aiohttp_stub.ClientTimeout = object
-_aiohttp_stub.TCPConnector = object
-sys.modules["aiohttp"] = _aiohttp_stub
+#
+# 桩的合法性判据（团队统一口径，勿违反）：
+#   桩的合法性 = **被桩模块的行为是否被断言依赖**。
+#   · aiohttp：其行为**不被离线断言依赖**，只有"模块级 import / def 时注解"
+#     需要那个**名字** → 可桩。
+#   · 反例（本仓库 test_publication_platforms.py 的 yaml）：yaml.safe_load 的
+#     **解析结果就是断言的输入** → 打桩会让断言退回与伪造配置比对 → **不可桩**。
+#
+# 因此这里必须**条件桩**，而不是无条件覆盖：
+#   · 依赖齐全（真 aiohttp 可导入）→ 保留真实包，--e2e 才能真发网络请求；
+#   · 仅 ImportError → 才补桩，使未装依赖的干净环境亦能直跑离线断言。
+# 早期版本"无条件覆盖 aiohttp.ClientSession = object"会把 --e2e 变成
+# 「任一次联网都必抛错 → 被 collect() 吞掉 → 打印 0 条 → 仍 RC=0」的**永远绿空跑**，
+# 比它要修的 print-only 更隐蔽，故此处必须条件化。
+try:
+    import aiohttp  # noqa: F401  依赖齐全 → 用真实包，--e2e 才真能联网
+except ImportError:
+    _aiohttp_stub = types.ModuleType("aiohttp")
+    _aiohttp_stub.ClientSession = object
+    _aiohttp_stub.ClientTimeout = object
+    _aiohttp_stub.TCPConnector = object
+    sys.modules["aiohttp"] = _aiohttp_stub
 # ---------------------------------------------------------------------------
 
 # 添加项目根目录到Python路径
@@ -57,7 +77,7 @@ def _make_offline_site(items):
     跳过 category_urls 是必要的：否则 collect() 会对 7 个分类页做
     2+3+...+8 秒的 sleep，测试会拖到 35s。
     """
-    site = ThepaperSite()
+    site = ThepaperSite("thepaper", {"timeout": 15})
     site.category_urls = []
 
     class _FakeResp:
@@ -129,72 +149,92 @@ async def test_truncation_guard_offline():
 
 
 async def test_thepaper_collection():
-    """测试澎湃新闻热榜采集功能（端到端，需要外网）"""
-    print("开始测试澎湃新闻热榜采集功能...")
+    """端到端网络采集（--e2e；需要外网 + 真实 aiohttp）。
 
-    # 创建澎湃新闻采集器实例
-    thepaper_collector = ThepaperSite()
+    判定全部走 check()、真实影响退出码（不再是"只 print 不置 FAILED"）：
+      · collect() 抛异常 / 未返回 list            → FAIL
+      · 返回 0 条（空跑：网络不可达或站点结构已变）→ FAIL
+      · 返回条数 > MAX_RESULTS（容量上界被突破）   → FAIL
+      · 结果 JSON 落盘异常                          → FAIL
+    过去该段只 print、不置 FAILED，导致 --e2e 无论空跑还是异常都 RC=0，
+    比它本想修的 print-only 更隐蔽，故改为真断言。
+    """
+    print("\n[2] 端到端网络采集（--e2e，需要外网 + 真实 aiohttp）")
 
+    # 构造口径必须与线上 SiteFactory.create_site(site_code, site_config) 一致：
+    # base.get_session() 会读 self.config.get("timeout", 10)，config 为 None 时
+    # 直接抛 AttributeError → 被 collect() 的 except 吞掉 → 静默返回 []（空跑）。
+    # 故此处显式传 dict；timeout 取 config/sites.yaml 中 thepaper 的实际值 15。
+    thepaper_collector = ThepaperSite("thepaper", {"timeout": 15})
+
+    results = None
     try:
-        # 执行采集
         results = await thepaper_collector.collect({})
+        check("e2e: collect() 无异常返回", True)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        check("e2e: collect() 无异常返回", False, f"{type(e).__name__}: {e}")
 
-        print(f"\n采集完成，共获取 {len(results)} 条数据")
+    if not isinstance(results, list):
+        check("e2e: collect() 返回 list",
+              False, f"type={type(results).__name__}")
+        return
 
-        # 保存页面内容供分析
-        if hasattr(thepaper_collector, 'page_content') and thepaper_collector.page_content:
+    print(f"\n采集完成，共获取 {len(results)} 条数据")
+
+    # —— 核心真断言 ——
+    check("e2e: 实际采到数据（空跑视为失败）",
+          len(results) > 0,
+          "len=0 —— 网络不可达 / 站点结构变化 / aiohttp 不可用导致空跑")
+    check(f"e2e: 条数 <= MAX_RESULTS({MAX_RESULTS})",
+          len(results) <= MAX_RESULTS,
+          f"len={len(results)} 突破容量上界")
+
+    # 预览与字段统计（仅展示，不参与判定）
+    print("\n前5条数据预览:")
+    for i, item in enumerate(results[:5]):
+        print(f"{i+1}. 标题: {item.get('title', 'N/A')}")
+        print(f"   链接: {item.get('url', 'N/A')}")
+        print(f"   热度: {item.get('hot', 'N/A')}")
+        print(f"   排名: {item.get('rank', 'N/A')}")
+        print("-" * 50)
+
+    required_fields = ['title', 'url', 'hot', 'rank']
+    valid_count = sum(
+        1 for it in results if all(it.get(f) for f in required_fields))
+    print(f"\n有效数据: {valid_count}/{len(results)} 条")
+
+    hot_values = [int(it['hot']) for it in results
+                  if str(it.get('hot', '')).isdigit()]
+    if hot_values:
+        is_sorted = all(hot_values[i] >= hot_values[i + 1]
+                        for i in range(len(hot_values) - 1))
+        print(f"热度排序: {'正确' if is_sorted else '错误'}")
+
+    # 页面内容落盘：尽力而为，非判定项
+    if getattr(thepaper_collector, 'page_content', None):
+        try:
             with open('thepaper_page.html', 'w', encoding='utf-8') as f:
                 f.write(thepaper_collector.page_content)
             print("页面内容已保存到 thepaper_page.html 文件")
+        except Exception as e:
+            print(f"页面内容保存失败（非判定项）: {e}")
 
-        # 显示前5条数据预览
-        print("\n前5条数据预览:")
-        for i, item in enumerate(results[:5]):
-            print(f"{i+1}. 标题: {item.get('title', 'N/A')}")
-            print(f"   链接: {item.get('url', 'N/A')}")
-            print(f"   热度: {item.get('hot', 'N/A')}")
-            print(f"   排名: {item.get('rank', 'N/A')}")
-            print("-" * 50)
-
-        # 数据验证
-        print("\n数据验证:")
-        if results:
-            required_fields = ['title', 'url', 'hot', 'rank']
-            valid_count = 0
-            for item in results:
-                if all(field in item and item[field] for field in required_fields):
-                    valid_count += 1
-
-            print(f"有效数据: {valid_count}/{len(results)} 条")
-
-            # 容量约束：collect() 返回的条数不得超过模块常量 MAX_RESULTS
-            # （该常量参与 limits.py 的容量预算，见 thepaper.py 顶部说明）
-            print(f"容量上限校验: MAX_RESULTS = {MAX_RESULTS}")
-            if len(results) <= MAX_RESULTS:
-                print(f"条数校验: {len(results)} <= MAX_RESULTS({MAX_RESULTS}) [OK]")
-            else:
-                print(f"条数校验: {len(results)} > MAX_RESULTS({MAX_RESULTS}) [FAIL]")
-
-            # 检查热度值是否正确排序
-            hot_values = [int(item['hot']) for item in results if 'hot' in item and item['hot'].isdigit()]
-            if hot_values:
-                is_sorted = all(hot_values[i] >= hot_values[i+1] for i in range(len(hot_values)-1))
-                print(f"热度排序: {'正确' if is_sorted else '错误'}")
-
-        # 保存结果到JSON文件
+    # 结果落盘：异常必须置 FAIL
+    try:
         with open('thepaper_results.json', 'w', encoding='utf-8') as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
+        check("e2e: 结果可落盘 thepaper_results.json", True)
         print("结果已保存到 thepaper_results.json 文件")
-
     except Exception as e:
-        print(f"测试过程中出现错误: {e}")
-        import traceback
-        traceback.print_exc()
+        check("e2e: 结果可落盘 thepaper_results.json",
+              False, f"{type(e).__name__}: {e}")
 
 
 async def main():
     print("=" * 66)
-    print("澎湃新闻采集：离线截断守卫断言")
+    print("澎湃新闻采集测试：离线截断守卫 + 端到端（--e2e）")
     print("=" * 66)
 
     await test_truncation_guard_offline()

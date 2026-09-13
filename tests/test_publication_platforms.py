@@ -16,8 +16,11 @@
   6. publish() 在缺少凭据时优雅失败（不发网络请求）
   7. publish() 对成功/失败响应的解析与 URL 拼装
 
-自带第三方依赖桩（aiohttp / app.core.config / app.utils.logger 等），
-不联网、不安装项目依赖，直接运行：
+自带部分第三方依赖桩（aiohttp / app.core.config / app.utils.logger 等），不联网。
+但 **PyYAML 不可桩**：`_load_yaml_config` 用真实 `yaml.safe_load` 解析真实
+`config/platforms.yaml`，断言依赖的正是**真实配置内容**——给它打桩会让断言退回
+与伪造配置比对（把测试弄坏，而非修好）。因此本测试**需已安装 PyYAML（见
+requirements.txt）** 方能运行，不保证在未装依赖的干净环境可跑：
 
     python tests/test_publication_platforms.py
 """
