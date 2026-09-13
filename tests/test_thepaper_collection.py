@@ -17,6 +17,22 @@ import asyncio
 import json
 import sys
 import os
+import types
+
+# ---------------------------------------------------------------------------
+# 依赖桩（照仓库其他离线测试 test_feishu_capacity.py 的写法）
+#
+# thepaper → .base 在**模块级** `import aiohttp`，且 base.get_session 的类型注解
+# `-> aiohttp.ClientSession` 会在 def 时求值 → 即使本测试全程走桩 session，
+# 模块导入本身也需要 aiohttp 这个"名字"存在。
+# 这里**无条件**打桩（不要 try/except 真实 import），使本测试在
+# **未安装项目依赖的干净环境也能直跑** —— 复现性优先于复用真实包。
+_aiohttp_stub = types.ModuleType("aiohttp")
+_aiohttp_stub.ClientSession = object
+_aiohttp_stub.ClientTimeout = object
+_aiohttp_stub.TCPConnector = object
+sys.modules["aiohttp"] = _aiohttp_stub
+# ---------------------------------------------------------------------------
 
 # 添加项目根目录到Python路径
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

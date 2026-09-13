@@ -805,7 +805,8 @@ class FeishuService:
         Args:
             keep_days: 保留最近多少天；None 表示不做时间维度的清理
             incoming: 本次准备写入的记录数（写前调用时传入，用于预留空间）
-            watermark: 目标水位线，默认 WATERMARK(14,000)
+            watermark: 目标水位线，默认取模块常量 WATERMARK（见 app/services/feishu/limits.py，
+                       不在此写死具体数字，避免与 limits 漂移）
             protect_today: 今日采集的数据最后才删。仅当非今日数据不足以腾出空间时，
                            才会回退删除今日最旧的记录（会在日志中明确告警）。
             dry_run: 只统计不删除，用于上线前验证清理规模
