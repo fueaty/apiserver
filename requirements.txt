@@ -1,18 +1,28 @@
-# apiserver 运行时依赖锁定（生产 pip freeze 快照的「去噪超集」）
+# apiserver 运行时依赖锁定（生产 pip freeze 快照的「去噪 + 补漏」超集）
 # ==============================================================================
-# 性质（请勿误读）：本文件是【生产 freeze(108) − 17 个 OS/RPM 与 file:// 包 = 91】
-#   的**超集**，**不是**经裁剪的项目依赖闭包。多余条目只会多装东西；漏包才是致命，
-#   因此采用「超集 + 静态 import 扫描复核」而非「闭包裁剪」。
+# 性质（请勿误读）：本文件 = 【生产 freeze(108) − 17 个 OS/RPM 与 file:// 包】
+#   + 【1 个 import 扫描补漏：jieba】= 92 条。它是**超集**（不是经裁剪的闭包）：
+#   多余条目只会多装东西，漏包才致命 → 采用「超集 + 全仓 import 扫描复核」而非闭包裁剪。
 #
 # 来源：生产机 home-service / openEuler 24.03 / Python 3.11.6
 #       （ssh -p 65023 root@192.168.3.105，部署在 /opt/apiserver）
 # 全量原始快照（108 条、含被剔除项）：doc/生产pip-freeze-openEuler24.03-py311-20260913.txt
 #
-# 静态 import 扫描复核（app/**/*.py + script/**/*.py，AST 口径）：
-#   共出现 20 个第三方顶层模块，**全部**在本文件有对应 pin（0 个漏配）；
-#   lark_oapi→lark-oapi、bs4→beautifulsoup4、jose→python-jose、yaml→PyYAML、
-#   pydantic_settings→pydantic-settings 等「导入名≠包名」均已逐条对上。
+# 全仓静态 import 扫描复核（app/ script/ function/ secret/ tests/ + 根目录，AST 口径）：
+#   共出现 **23** 个第三方顶层模块，全部在本文件有对应 pin（0 漏配）；
+#   其中 7 个「导入名≠包名」已逐条对上：jose→python-jose、jwt→PyJWT、
+#   bs4→beautifulsoup4、lark_oapi→lark-oapi、pydantic_settings→pydantic-settings、
+#   sklearn→scikit-learn、yaml→PyYAML。
 #   口径局限：不含动态字符串导入（importlib）与 dnf 提供的 OS 包。
+#   （口径修正记录：早前只扫 app/+script/ 得 20 个，漏掉 secret/ 与根目录训练脚本里的
+#     jwt/jieba/sklearn；已改全仓口径，并由 tests/test_requirements_coverage.py 永久固化。）
+#
+# 相对快照的**唯一新增**（不在生产 freeze 内）：
+#   jieba==0.42.1 —— 仅被根目录训练脚本 train_content_matching_model.py 使用；
+#   该脚本**未部署到生产**、生产**未安装** jieba。因「漏包致命、多包无害」显式补入，
+#   否则按本文件装完环境后跑训练脚本会 ImportError（与当年 lark_oapi 缺口同构）。
+#   注：joblib / numpy / pandas / scikit-learn **不属**此列 —— 它们还被已部署的
+#   app/services/selection/ml_engine.py 使用、且生产实测已安装，属正常运行时依赖。
 #
 # 被剔除的 17 个系统包（dnf 安装、无法从 PyPI 复现，均非本项目依赖）：
 #   argcomplete, asciidoc, configobj, cockpit, dbus-python, distro, gpg,
@@ -60,6 +70,7 @@ httptools==0.8.0
 httpx==0.28.1
 humanize==4.16.0
 idna==3.6
+jieba==0.42.1
 joblib==1.6.0
 kombu==5.6.2
 lark-oapi==1.7.3
