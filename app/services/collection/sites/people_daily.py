@@ -8,6 +8,10 @@ from datetime import datetime
 from .base import BaseSite
 # 导入统一的ID生成函数
 from ....utils.id_generator import generate_content_id
+# mock 行的显式标记（见 app/services/collection/mock_utils.py）。
+# 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
+# 有测试锁：tests/test_mock_governance.py。
+from ..mock_utils import MOCK_FLAG
 
 
 class PeopleDailySite(BaseSite):
@@ -121,7 +125,11 @@ class PeopleDailySite(BaseSite):
         return results
     
     def _get_mock_data(self) -> List[Dict[str, Any]]:
-        """获取模拟数据（用于演示或备用）"""
+        """获取模拟数据（用于演示或备用）。
+
+        ⚠️ 演示数据**绝不允许进入飞书表**。每条都显式打 `is_mock=True` 标记，
+        写入层按标记排除（见 mock_utils.py），不依赖「mock 恰好没被包 fields」这个 bug。
+        """
         return [
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -131,7 +139,8 @@ class PeopleDailySite(BaseSite):
                 'rank': '1',
                 'published_at': '2024-01-01 09:00:00',
                 'collected_at': self._get_current_time(),
-                'site_code': self.site_code
+                'site_code': self.site_code,
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             },
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -141,6 +150,7 @@ class PeopleDailySite(BaseSite):
                 'rank': '2',
                 'published_at': '2024-01-01 08:30:00',
                 'collected_at': self._get_current_time(),
-                'site_code': self.site_code
+                'site_code': self.site_code,
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             }
         ]

@@ -166,10 +166,14 @@ async def main():
     check("⑤ 真实对齐后一条都不丢（len 相等且 > 0）",
           len(aligned) == len(out) and len(aligned) > 0,
           f"out={len(out)} aligned={len(aligned)}")
-    check("⑤b 对齐后字段集完整且 site_code 保留",
-          all(set(a["fields"].keys()) == expected_fields
-              and a["fields"].get("site_code") == "thepaper" for a in aligned),
-          f"样例={aligned[0] if aligned else 'N/A'}")
+    # ⑤b 修复（QA 实测缺陷）：原写法 `all(...)` 在 aligned 为空时因 all([])==True
+    # 而**空集通过**（分母为 0，无鉴别力）；变异体下仍报 [OK]。
+    # 补 `len(aligned) > 0 and ...`：aligned 为空即 FAIL。
+    check("⑤b 对齐后字段集完整且 site_code 保留（aligned 非空；空集即 FAIL）",
+          len(aligned) > 0
+          and all(set(a["fields"].keys()) == expected_fields
+                  and a["fields"].get("site_code") == "thepaper" for a in aligned),
+          f"aligned={len(aligned)} 样例={aligned[0] if aligned else 'N/A'}")
 
     # ⑥ 授权2：形状不符（扁平 dict）时必须**发出 warning**，不得再静默丢弃
     import logging

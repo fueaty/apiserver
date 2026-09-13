@@ -8,6 +8,10 @@ from datetime import datetime
 from .base import BaseSite
 # 导入统一的ID生成函数
 from ....utils.id_generator import generate_content_id
+# mock 行的显式标记（见 app/services/collection/mock_utils.py）。
+# 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
+# 有测试锁：tests/test_mock_governance.py。
+from ..mock_utils import MOCK_FLAG
 
 
 class XinhuaSite(BaseSite):
@@ -166,7 +170,14 @@ class XinhuaSite(BaseSite):
                 'collected_at': item['collected_at'],
                 'site_code': item['site_code']
             }
-            
+
+            # 关键：本段「按固定键重建 result」会把 _get_mock_data() 打的 mock 标记抹掉。
+            # 当解析路径回退到 mock（上方 `if not hot_data: hot_data = self._get_mock_data()`）
+            # 时，必须把标记**透传**回来，否则 mock 在这里被「洗白」成普通记录 → 静默混入写集
+            #（这是 xinhua 解析路径的潜在泄漏点，见 mock_utils.py 模块注释）。
+            if item.get(MOCK_FLAG) is True:
+                result[MOCK_FLAG] = True
+
             # 数据清洗和验证
             if self._validate_result(result):
                 results.append({"fields": result})
@@ -174,7 +185,13 @@ class XinhuaSite(BaseSite):
         return results
     
     def _get_mock_data(self) -> List[Dict[str, Any]]:
-        """获取模拟数据（用于演示或备用）"""
+        """获取模拟数据（用于演示或备用）。
+
+        ⚠️ 演示数据**绝不允许进入飞书表**。每条都显式打 `is_mock=True` 标记：
+        写入层（script/collection_pipeline.py）用 split_real_and_mock() 按此标记把
+        mock 行排除出写集，而**不是**依赖「mock 恰好没被包成 {'fields': item}」
+        这个 bug 来兜底（见 mock_utils.py）。
+        """
         return [
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -184,7 +201,8 @@ class XinhuaSite(BaseSite):
                 'rank': '1',
                 'published_at': '2024-01-01 09:00:00',
                 'collected_at': self._get_current_time(),
-                'site_code': self.site_code
+                'site_code': self.site_code,
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             },
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -194,6 +212,7 @@ class XinhuaSite(BaseSite):
                 'rank': '2',
                 'published_at': '2024-01-01 08:30:00',
                 'collected_at': self._get_current_time(),
-                'site_code': self.site_code
+                'site_code': self.site_code,
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             }
         ]

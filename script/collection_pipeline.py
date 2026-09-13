@@ -28,6 +28,23 @@ from app.services.feishu.limits import (
 )
 from app.core.config import config_manager                     # 配置管理器
 import app.wework.notification_push as notification_push
+# mock 治理：把 mock 回退行按**显式意图标记**排除出写集（而不是靠「忘了包 fields」这个 bug）。
+from app.services.collection.mock_utils import split_real_and_mock, MOCK_FLAG
+
+
+def _site_code_of(record):
+    """从一条采集记录中尽力取出 site_code。
+
+    兼容两种形态：扁平行 ``{..., 'site_code': X}`` 与
+    ``{'fields': {..., 'site_code': X}}``（对齐层期望的形状）。
+    仅用于**报表/归因**，取不到时返回 "?"，绝不抛异常影响主流程。
+    """
+    if not isinstance(record, dict):
+        return "?"
+    inner = record.get("fields")
+    if isinstance(inner, dict):
+        return inner.get("site_code") or "?"
+    return record.get("site_code") or "?"
 
 
 async def test_collection_pipeline():
@@ -77,7 +94,29 @@ async def test_collection_pipeline():
                 # 打印前2条新闻作为示例
                 for i, news in enumerate(result["news"][:2]):
                     print(f"     新闻 {i+1}: {news.get('fields', {}).get('title', '无标题')}")
-        
+
+        # —— (a) 站点级检测器（改 E）：抓「站点根本没被采」与「采到 0 条」——
+        # 与「批次级形状差额」互不替代：站点级回答**哪些站缺席**，批次级回答**条数去哪了**。
+        # 站点若因未启用/未配置/采集为空而不出现在结果里，此前是**完全静默**的
+        #（thepaper 曾因 site_code 未被 enabled 收窄命中而长期 0 条且无日志）。
+        # 口径：enabled = 引擎声明的可用站点（单一事实来源 sites.yaml）；
+        #       got     = 本次真正产出数据(>0)的站点；差集即缺口。
+        # 只告警、不 raise —— 缺席站点不阻断其余站点的入库。
+        enabled_sites = {s["site_code"] for s in collection_engine.get_available_sites()}
+        got_sites = {
+            r.get("site_code") for r in collection_results
+            if r.get("data_count", 0) > 0
+        }
+        site_gap = sorted(enabled_sites - got_sites)
+        if site_gap:
+            site_gap_msg = (
+                f"⚠️ 站点级采集缺口：已启用 {len(enabled_sites)} 个站点，"
+                f"本次未产出任何数据的站点 {len(site_gap)} 个：{site_gap}。"
+                f"（可能是该站未启用/配置缺失/采集为空；与批次级写入差额无关）"
+            )
+            notification_push.send_message(site_gap_msg)
+            print(site_gap_msg)
+
         # 第三步：将采集结果存储到飞书表格...
         print("\n3. 将采集结果存储到飞书表格...")
         
@@ -96,13 +135,30 @@ async def test_collection_pipeline():
             return False
             
         # 整理采集到的数据，准备存入飞书表格
-        feishu_records = []
+        feishu_records_raw = []
         for result in collection_results:
             # 确保每条结果都有新闻数据
             if result and result.get("news"):
                 # 将新闻数据添加到总记录列表中
-                feishu_records.extend(result["news"])
-        
+                feishu_records_raw.extend(result["news"])
+
+        # —— (b) mock 治理 I1/I2：先把 mock 回退行按**显式意图标记**剔除，再进入写集 ——
+        # I1：mock 行不得入库，且由 is_mock 标记保证（**不**依赖「mock 恰好是扁平行 →
+        #     被对齐层静默丢弃」这个 bug 兜底——一旦有人给 mock 也包上 {'fields': item}
+        #     来"修形状不一致"，旧写法就会让 mock 静默入库污染生产表）。
+        # I2：mock 回退必须可观测，且与「形状差额」**分开**报（否则差额告警被 mock 刷屏）。
+        # I3：真实数据不受影响——split_real_and_mock 只按标记拆，真实行原样保留。
+        feishu_records, mock_records = split_real_and_mock(feishu_records_raw)
+        if mock_records:
+            mock_sites = sorted({_site_code_of(r) for r in mock_records})
+            mock_msg = (
+                f"⚠️ 采集回退到 mock 演示数据 {len(mock_records)} 条，"
+                f"已按 '{MOCK_FLAG}' 标记排除出写集（涉事站点：{mock_sites}）。"
+                f"该站点本次真实采集失败或为空，请人工检查。"
+            )
+            notification_push.send_message(mock_msg)
+            print(mock_msg)
+
         print(f"   准备存储 {len(feishu_records)} 条记录到飞书表格")
         
         # 确保飞书表格具有所需的字段结构
@@ -258,12 +314,14 @@ async def test_collection_pipeline():
                 # 「送出 329 / 写入 227 / 差额 102 ≈ thepaper 全部」被当成正常成功。
                 sent_count = len(records_to_create)
                 diff = sent_count - record_count
+                # (e) 差额>0 时**抑制**「成功」文案：过去差额告警与
+                #     「✅ 采集任务执行成功，更新 M 条」**并发**，"成功"字样直接误导读者
+                #     （2026-09-14 QA 误发 3 条企微消息的放大因素）。改为二选一。
                 if diff > 0:
-                    gap_msg = (f"⚠️ 采集写入差额：送出 {sent_count} 条 / 写入 {record_count} 条 "
-                               f"/ 差额 {diff} 条（疑似形状不符被丢弃，见对齐告警日志）")
-                    notification_push.send_message(gap_msg)
-                    print(gap_msg)
-                msg = f"✅ 采集任务执行成功，更新 {record_count} 条记录到飞书多维表格"
+                    msg = (f"⚠️ 部分写入：送出 {sent_count} 条 / 写入 {record_count} 条 "
+                           f"/ 差额 {diff} 条（疑似形状不符被丢弃，见对齐告警日志）")
+                else:
+                    msg = f"✅ 采集任务执行成功，更新 {record_count} 条记录到飞书多维表格"
                 notification_push.send_message(msg)
                 print(msg)
             else:
