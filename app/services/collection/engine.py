@@ -144,12 +144,21 @@ class CollectionEngine:
                 await site.cleanup()
     
     def _get_target_sites(self, site_code_input = None) -> List[str]:
-        """获取目标站点列表"""
+        """获取目标站点列表。
+
+        单一事实来源：不传 site_code_input 时，返回 ``config/sites.yaml`` 中
+        ``enabled=true`` 的全部站点；传入 site_code_input 时，只在**已启用集合内收窄**，
+        绝不会新增未启用/未知的站点。
+
+        为什么这里要告警：过去「显式点名却不在已启用集合内」的 code 被静默丢弃，
+        于是「传了一份不含 X 的白名单 / X 拼错 / X 未启用」都会退化成 0 条且无任何日志——
+        thepaper 曾因此长期静默漏采。
+        """
         all_sites = [code for code, cfg in self.sites_config.items() if cfg.get("enabled", True)]
-        
+
         if not site_code_input:
             return all_sites
-        
+
         # 处理不同类型的输入
         if isinstance(site_code_input, str):
             # 字符串格式："site1,site2"
@@ -160,8 +169,25 @@ class CollectionEngine:
         else:
             # 其他类型转换为字符串处理
             target_sites = [str(site_code_input).strip()]
-            
-        return [code for code in target_sites if code in all_sites]
+
+        resolved = [code for code in target_sites if code in all_sites]
+
+        # 显式点名但不在「已启用集合」内的 code：必须留痕，不能静默丢弃。
+        dropped = [code for code in target_sites if code not in all_sites]
+        if dropped:
+            logger.warning(
+                "目标站点中存在未启用/未知的 code，已丢弃: %s；当前已启用站点全集: %s"
+                % (dropped, all_sites)
+            )
+
+        # 「传了列表却一个都不匹配」——正是静默 0 条的事故形态，升级为 error。
+        if target_sites and not resolved:
+            logger.error(
+                "目标站点全部无法匹配已启用集合（结果为空）: 请求=%s，已启用=%s"
+                % (target_sites, all_sites)
+            )
+
+        return resolved
     
     def _prepare_site_params(self, base_params: Dict[str, Any], site_code: str, site_config: Dict[str, Any]) -> Dict[str, Any]:
         """准备站点特定参数"""

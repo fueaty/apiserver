@@ -47,8 +47,13 @@ async def test_collection_pipeline():
         selection_engine = SelectionEngine()
         feishu_service = FeishuService()
         # 设置采集参数
+        # 目标站点由 config/sites.yaml 的 enabled 字段决定（单一事实来源），
+        # 这里**不再**传 site_code 白名单——否则 sites.yaml 的 enabled 形同虚设：
+        # 新增/启用站点会静默 0 条入库且不报错
+        # （防御见 app/services/collection/engine.py 的 _get_target_sites 告警）。
+        # 如需临时收窄，请在调用 CollectionEngine.collect() 时显式传 site_code；
+        # 引擎只会在 enabled 集合内**收窄，不会新增**（engine.py:146-164）。
         collection_params = {
-            "site_code": ["weibo", "xiaohongshu", "zhihu", "baidu", "xinhua", "tech_36kr", "people_daily", "cctv"],  # 指定要采集的平台
             "format": "feishu"     # 指定返回飞书格式的数据，便于直接存储
         }
         
