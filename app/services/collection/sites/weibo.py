@@ -9,6 +9,10 @@ from datetime import datetime
 from .base import BaseSite
 # 导入统一的ID生成函数
 from ....utils.id_generator import generate_content_id
+# mock 行的显式标记（见 app/services/collection/mock_utils.py）。
+# 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
+# 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
+from ..mock_utils import MOCK_FLAG
 
 try:
     from playwright.async_api import async_playwright
@@ -296,7 +300,12 @@ class WeiboSite(BaseSite):
         return unique_data[:50]
     
     def _get_mock_data(self) -> List[Dict[str, Any]]:
-        """获取模拟数据（用于演示或备用）"""
+        """获取模拟数据（用于演示或备用）。
+
+        ⚠️ 演示数据**绝不允许进入飞书表**。本函数 mock 已是 {"fields": {...}} 字面量，
+        故标记必须加在**内层 dict** —— is_mock_record 会查内层 fields.is_mock，
+        否则包装体会被误判为真实记录、静默入库。
+        """
         return [
             {
                 "fields": {
@@ -307,7 +316,8 @@ class WeiboSite(BaseSite):
                     'rank': '1',
                     'published_at': '2024-01-01 10:00:00',
                     'collected_at': self._get_current_time(),
-                    'site_code': self.site_code
+                    'site_code': self.site_code,
+                    MOCK_FLAG: True,  # mock 显式标记，禁止入库
                 }
             }
         ]

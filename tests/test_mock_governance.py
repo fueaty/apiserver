@@ -3,53 +3,45 @@
 """
 mock 治理（写入路径）回归测试锁 —— 离线，无外网。
 
-背景（为什么需要这把锁）：
-  某站点采集失败/解析为空时，会**回退到 `_get_mock_data()`** 返回演示假数据
-  （xinhua / people_daily / tech_36kr）。历史上这些假数据「恰好」是**扁平 dict**，
-  而飞书写入层 `FeishuService._align_records_with_fields` 要求 `{"fields": item}` 形状，
-  于是扁平行被**静默丢弃** —— 也就是说「mock 不入库」当时是**靠一个 bug 兜底**：
-  一旦有人给 mock 也包上 `{"fields": item}`（看似在「修形状不一致」），
-  mock 就会**静默进入生产表**，污染线上数据且不报错。
+背景：站点采集失败/解析为空时会**回退到 `_get_mock_data()`** 返回演示假数据。
+这些假数据**绝不允许进入飞书表**。历史上部分站点 mock「恰好」是扁平 dict，
+因写入层要求 {"fields": item} 形状而被**顺带丢弃** —— 即「mock 不入库」曾**靠 bug 兜底**。
+一旦有人给 mock 也包上 {"fields": item}（看似在「修形状不一致」），mock 就会静默入库。
+P1 只给 3 站打了标记，而 baidu/cctv/weibo/xiaohongshu 的 mock **本就已经是包装体**
+（且都在活跃失败路径上）→ 会被判为真实、进入写集（潜在泄漏，非正在发生）。
 
-治理方案（实现见 `app/services/collection/mock_utils.py`）：
-  · 各站点在 mock 行上打**显式标记** `is_mock=True`（MOCK_FLAG）；
-  · 写入层（`script/collection_pipeline.py`）用 `split_real_and_mock()` 按**标记**
-    把 mock 行排除出写集，并**单独**上报（与「批次级形状差额」分开）。
+治理方案（见 app/services/collection/mock_utils.py）：
+  · 各站点在 mock 行**内部**打显式标记 MOCK_FLAG(is_mock)=True；
+  · 写入路径（script/collection_pipeline.py）用 split_real_and_mock() 按标记剔除。
 
-三条不变式（本测试逐条锁死）：
-  I1  mock 行不得进入写集，且由**意图标记**保证（不依赖「忘了包 fields」这个 bug）。
-  I2  mock 回退可观测、且与形状差额**可分离**（本测试锁定「可识别/可分离」这一前提）。
-  I3  真实数据不受影响（split 只按标记拆，真实行原样保留）。
-
-禁令（本测试的「未被包装」断言即其守卫）：
-  不得给 xinhua / tech_36kr / people_daily 的 mock 返回路径补 `{"fields": item}`。
-
-变异对照（证明本测试有鉴别力 —— 若没有，这些锁就是"假绿"）：
-  M1「把 mock 包上 fields」  → 「未包装」断言必须变 False（被检出）。
-  M2「抹掉 is_mock 标记」     → I1 断言必须变 False（被检出）。
-  M3「is_mock 只看顶层」      → 嵌套形态漏检（证明嵌套分支是**承重**的、被断言依赖）。
+本测试（**动态枚举**，不写死站点）：
+  [A] 禁令：仅 xinhua/people_daily/tech_36kr 的 mock 返回路径必须**不被包装**（保持扁平）。
+  [B] 动态枚举 sites/*.py 中**所有**定义 _get_mock_data 的站点：
+      逐站 mock 100% 判为 mock、split 后 real==0；并做**负控**（真实记录判为 real，防误伤）。
+  [C] xinhua 解析路径回退 mock：即便被包成 {"fields": item} 也不得入写集。
+  [D] I3：真实数据不受影响。
+  [E] 变异对照（M1 包装 / M2 抹标记 / M3 仅顶层）。
+  [F] 接线锁（pipeline / enhanced_collection）。
+  [G] N2：xiaohongshu._is_mock_data 改为基于标记；真实路径不被替换。
+  [H] N1：enhanced_collection 第二条写入路径在重建记录前过滤 mock。
 
 依赖桩（**条件桩**；判据：桩的合法性 = 被桩模块的行为是否被断言依赖）：
-  本测试只做「取 mock 值 + 纯逻辑拆分 + 源文件接线扫描」，**不联网**。
-  故 aiohttp / bs4 等只在 ImportError 时才补桩：
-    · aiohttp：`.base` 模块级 `import aiohttp` + `def get_session() -> aiohttp.ClientSession`
-      会在 def 时求值注解 → 仅需该**名字**存在；行为不被断言依赖。
-    · bs4：`xinhua._parse_xinhua_homepage_data` 方法体内 `from bs4 import BeautifulSoup`；
-      本测试对解析路径只依赖「解析为空 → 回退 mock」这一行为（真实 bs4 与桩对空串均产出空）。
+  aiohttp/bs4/yaml 等只在 ImportError 时注入（本测试不联网、不断言其行为）。
 
     python tests/test_mock_governance.py     # 期望 RC=0
 """
 
+import asyncio
+import importlib
 import os
 import sys
 import types
 
 # ---------------------------------------------------------------------------
-# 条件依赖桩（仅在缺失时注入，绝不覆盖已安装的真实包）
+# 条件依赖桩（仅缺失时注入，绝不覆盖已安装的真实包）
 # ---------------------------------------------------------------------------
 def _stub_module(name):
     m = types.ModuleType(name)
-    # 返回「类」，兼容 `from x import Base` / `x.SomeAttr(...)` 的"名字"需求
     m.__getattr__ = lambda attr: type(attr, (object,), {})
     m.__all__ = []
     return m
@@ -72,8 +64,7 @@ for _name in (
     except Exception:
         sys.modules[_name] = _stub_module(_name)
 
-# bs4 需要一点"行为"：对空/无效输入产出空 soup，使 xinhua 解析路径稳定回退到 mock。
-# （真实 bs4 对 "<html></html>" 也解析不出新闻条目 → 同样回退，故两者行为一致。）
+# bs4：对空/无效输入产出空 soup（真实 bs4 对 "<html></html>" 也解析不出条目 → 行为一致）
 if "bs4" not in sys.modules:
     try:
         import bs4  # noqa: F401
@@ -90,6 +81,15 @@ if "bs4" not in sys.modules:
         _bs4.BeautifulSoup = _FakeSoup
         sys.modules["bs4"] = _bs4
 
+# yaml：xiaohongshu/zhihu 仅在 __init__ 里读配置（失败即回退 {}）；其行为不被断言依赖。
+if "yaml" not in sys.modules:
+    try:
+        import yaml  # noqa: F401
+    except Exception:
+        _yaml = types.ModuleType("yaml")
+        _yaml.safe_load = lambda *a, **k: {}
+        sys.modules["yaml"] = _yaml
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT)
 
@@ -98,9 +98,7 @@ from app.services.collection.mock_utils import (  # noqa: E402
     is_mock_record,
     split_real_and_mock,
 )
-from app.services.collection.sites.xinhua import XinhuaSite          # noqa: E402
-from app.services.collection.sites.people_daily import PeopleDailySite  # noqa: E402
-from app.services.collection.sites.tech_36kr import Tech36krSite     # noqa: E402
+from app.services.collection.sites.base import BaseSite  # noqa: E402
 
 PASSED, FAILED = [], []
 
@@ -114,81 +112,118 @@ def check(name, cond, detail=""):
         print(f"  [FAIL] {name}  {detail}")
 
 
-# 三站公共口径：(site_code, 站点类)
-SITE_CASES = [
-    ("xinhua", XinhuaSite),
-    ("people_daily", PeopleDailySite),
-    ("tech_36kr", Tech36krSite),
-]
+SITES_DIR = os.path.join(ROOT, "app", "services", "collection", "sites")
+
+# 3 个**必须保持扁平** mock 返回路径的站点（禁令范围）。
+FLAT_MOCK_SITES = ("xinhua", "people_daily", "tech_36kr")
 
 
-def test_mock_marker_and_exclusion():
-    """(A) 禁令 + (B) I1：mock 返回路径未被包装；mock 行带标记且被排除出写集。"""
-    print("\n[A] 禁令：mock 返回路径**未**被包装（无 'fields' 键）")
-    print("[B] I1：mock 行带 is_mock 标记，且被 split_real_and_mock 排除出写集")
+def _sites_with_mock():
+    """动态枚举：扫描 sites/*.py 中所有定义 `_get_mock_data` 的站点（不写死名单）。
 
-    for code, cls in SITE_CASES:
-        site = cls(code, {"timeout": 10})
-        rows = site._get_mock_data()
+    用**源码扫描**决定要 import 哪些模块，避免为无关站点引入额外依赖解析。
+    将来新增带 mock 的站点会自动纳入。
+    """
+    codes = []
+    for fn in sorted(os.listdir(SITES_DIR)):
+        if not fn.endswith(".py") or fn.startswith("_"):
+            continue
+        with open(os.path.join(SITES_DIR, fn), encoding="utf-8") as f:
+            if "def _get_mock_data" in f.read():
+                codes.append(fn[:-3])
+    return codes
 
-        check(f"[{code}] mock 返回非空 list",
-              isinstance(rows, list) and len(rows) > 0,
-              f"type={type(rows).__name__} len={len(rows) if isinstance(rows, list) else 'N/A'}")
 
-        # (A) 禁令守卫：mock 返回路径**不得**是 {"fields": item}
-        check(f"[{code}] 禁令：mock 返回路径未被包装（每条都无 'fields' 键）",
+def _load_site_class(code):
+    mod_name = f"app.services.collection.sites.{code}"
+    mod = importlib.import_module(mod_name)
+    for obj in vars(mod).values():
+        if (isinstance(obj, type)
+                and getattr(obj, "__module__", "") == mod_name
+                and issubclass(obj, BaseSite)
+                and hasattr(obj, "_get_mock_data")):
+            return obj
+    return None
+
+
+def test_ban_on_wrapping():
+    """[A] 禁令：3 站的 mock 返回路径必须保持扁平（未被包装成 {'fields': item}）。"""
+    print("\n[A] 禁令：仅 xinhua/people_daily/tech_36kr 的 mock 返回路径不得被包装")
+    for code in FLAT_MOCK_SITES:
+        cls = _load_site_class(code)
+        check(f"[A:{code}] 站点类可加载", cls is not None, "未找到 BaseSite 子类")
+        if cls is None:
+            continue
+        rows = cls(code, {"timeout": 10})._get_mock_data()
+        check(f"[A:{code}] 禁令：mock 每条都无 'fields' 键（未包装）",
               all(isinstance(r, dict) and "fields" not in r for r in rows),
               f"首条键={list(rows[0].keys()) if rows else 'N/A'}")
 
-        # (B) I1：每条 mock 都被标记识别
-        check(f"[{code}] I1：每条 mock 都被 is_mock_record 识别（标记存在）",
-              all(is_mock_record(r) for r in rows),
-              f"识别={sum(1 for r in rows if is_mock_record(r))}/{len(rows)}")
 
-        # (B) I1：全部被排除出写集
+def test_dynamic_enumeration():
+    """[B] 动态枚举：所有含 _get_mock_data 的站点，mock 100% 被判为 mock + 负控。"""
+    print("\n[B] 动态枚举：sites/*.py 中所有 _get_mock_data 站点")
+
+    codes = _sites_with_mock()
+    check("[B] 发现的 mock 站点数 >= 7（防枚举退化）",
+          len(codes) >= 7, f"发现={codes}")
+
+    for code in codes:
+        cls = _load_site_class(code)
+        check(f"[B:{code}] 站点类可加载", cls is not None, "未找到 BaseSite 子类")
+        if cls is None:
+            continue
+
+        rows = cls(code, {"timeout": 10})._get_mock_data()
+        check(f"[B:{code}] mock 非空 list",
+              isinstance(rows, list) and len(rows) > 0,
+              f"len={len(rows) if isinstance(rows, list) else 'N/A'}")
+
+        n_mock = sum(1 for r in rows if is_mock_record(r))
+        check(f"[B:{code}] 100% 判为 mock（每一条都带标记，含包装体内层）",
+              len(rows) > 0 and n_mock == len(rows),
+              f"{n_mock}/{len(rows)} 判为 mock；首条={rows[0] if rows else 'N/A'}")
+
         real, mock = split_real_and_mock(rows)
-        check(f"[{code}] I1：mock 全部被排除出写集（real 为空、mock 等于全量）",
+        check(f"[B:{code}] split_real_and_mock：real==0、mock==全量",
               len(real) == 0 and len(mock) == len(rows),
               f"real={len(real)} mock={len(mock)} 输入={len(rows)}")
 
+        # 负控：真实记录（无标记，扁平 + 包装两种形态）必须判为 real，防误伤
+        neg_flat = {"id": "r1", "title": "真实标题", "url": "https://x/1", "site_code": code}
+        neg_wrapped = {"fields": dict(neg_flat)}
+        neg_real, neg_mock = split_real_and_mock([neg_flat, neg_wrapped])
+        check(f"[B:{code}] 负控：真实记录（扁平/包装）判为 real、不误伤",
+              (not is_mock_record(neg_flat)) and (not is_mock_record(neg_wrapped))
+              and len(neg_mock) == 0 and len(neg_real) == 2,
+              f"flat_mock={is_mock_record(neg_flat)} wrapped_mock={is_mock_record(neg_wrapped)}")
+
 
 def test_xinhua_parse_path_leak_closed():
-    """(C) xinhua 解析路径的**潜在泄漏**必须被关闭。
+    """[C] xinhua 解析路径回退 mock：即便被包成 {'fields': item} 也不得入写集。"""
+    print("\n[C] xinhua 解析路径回退 mock：即便被包装也不得入写集")
 
-    泄漏点：`_parse_xinhua_homepage_data` 在解析为空时回退到 `_get_mock_data()`，
-    随后该函数把结果统一包装成 `{"fields": item}`（第 172 行）——
-    即 mock 在这里被「洗白」成与真实数据同形的记录。
-    xinhua 是**唯一**存在此解析级 mock 回退的站点，若不在重建 result 时透传 is_mock，
-    这些 mock 就会以 `{"fields": ...}` 形状**进入写集**（对齐层不再丢弃它们）。
-
-    断言：回退产物虽是 `{"fields": ...}`，但内层带 is_mock → 仍被识别并排除。
-    """
-    print("\n[C] xinhua 解析路径回退 mock：即便被包装成 {'fields': item} 也不得入写集")
-
-    site = XinhuaSite("xinhua", {"timeout": 10})
+    site = _load_site_class("xinhua")("xinhua", {"timeout": 10})
     parsed = site._parse_xinhua_homepage_data("<html></html>")
 
-    check("[C] 解析路径回退时确实产出了记录（非空，证明走了 mock 回退）",
+    check("[C] 解析路径回退时确实产出了记录（走了 mock 回退）",
           isinstance(parsed, list) and len(parsed) > 0,
           f"len={len(parsed) if isinstance(parsed, list) else 'N/A'}")
-
-    check("[C] 解析路径输出是 {'fields': item} 包裹形态（这正是泄漏的危险形状）",
+    check("[C] 输出是 {'fields': item} 包裹形态（泄漏的危险形状）",
           all(isinstance(e, dict) and isinstance(e.get("fields"), dict) for e in parsed),
           f"首元素键={list(parsed[0].keys()) if parsed else 'N/A'}")
-
-    check("[C] 泄漏关闭①：包裹后的 mock 仍被 is_mock_record 识别（嵌套标记透传成功）",
+    check("[C] 泄漏关闭①：包裹后的 mock 仍被 is_mock_record 识别（嵌套标记透传）",
           all(is_mock_record(e) for e in parsed),
           f"识别={sum(1 for e in parsed if is_mock_record(e))}/{len(parsed)}")
-
     real_c, mock_c = split_real_and_mock(parsed)
-    check("[C] 泄漏关闭②：包裹后的 mock 仍被排除出写集（real 为空）",
+    check("[C] 泄漏关闭②：包裹后的 mock 仍被排除出写集（real==0）",
           len(real_c) == 0 and len(mock_c) == len(parsed),
           f"real={len(real_c)} mock={len(mock_c)} 输入={len(parsed)}")
 
 
 def test_real_records_unaffected():
-    """(D) I3：真实（无标记）记录不得被误伤。"""
-    print("\n[D] I3：真实数据不受影响（split 只按标记拆）")
+    """[D] I3：真实（无标记）记录不得被误伤。"""
+    print("\n[D] I3：真实数据不受影响")
 
     real_rows = [
         {"id": "r1", "title": "真实新闻1", "url": "https://example.com/1", "site_code": "cctv"},
@@ -196,88 +231,124 @@ def test_real_records_unaffected():
                     "site_code": "cctv"}},
     ]
     real_d, mock_d = split_real_and_mock(real_rows)
-
-    check("[D] 真实（无标记）记录一条都不被误判为 mock",
+    check("[D] 真实记录一条都不被误判为 mock",
           len(mock_d) == 0 and len(real_d) == len(real_rows),
           f"real={len(real_d)} mock={len(mock_d)}")
-
-    check("[D] 真实记录原样保留（顺序/内容不变）",
-          real_d == real_rows, f"got={real_d}")
+    check("[D] 真实记录原样保留（顺序/内容不变）", real_d == real_rows, f"got={real_d}")
 
 
 def test_mutation_controls():
-    """(E) 变异对照：证明上述断言真有鉴别力（无变异对照的"全绿"不可信）。"""
+    """[E] 变异对照：证明断言有鉴别力。"""
     print("\n[E] 变异对照（证明测试有鉴别力）")
 
-    rows = XinhuaSite("xinhua", {"timeout": 10})._get_mock_data()
+    rows = _load_site_class("xinhua")("xinhua", {"timeout": 10})._get_mock_data()
 
-    # M1「把 mock 包上 fields」→ 「未包装」断言必须变 False（被检出）
     wrapped = [{"fields": dict(r)} for r in rows]
-    m1_detected = not all("fields" not in r for r in wrapped)
     check("M1 变异：把 mock 包上 fields → 『未包装』断言变 False（被检出）",
-          m1_detected, "变异体未被检出 = 本锁无鉴别力")
+          not all("fields" not in r for r in wrapped), "变异体未被检出 = 无鉴别力")
 
-    # M1b 纵深防御：即便被包装，嵌套标记仍使其被排除（对照 2026-09-14 的隐患）
     real_m1, mock_m1 = split_real_and_mock(wrapped)
     check("M1b 纵深防御：mock 被包装后仍按嵌套标记排除出写集",
           len(real_m1) == 0 and len(mock_m1) == len(wrapped),
-          f"real={len(real_m1)} mock={len(mock_m1)} 输入={len(wrapped)}")
+          f"real={len(real_m1)} mock={len(mock_m1)}")
 
-    # M2「抹掉 is_mock 标记」→ I1 断言必须变 False（证明标记是**承重**的）
     stripped = [{k: v for k, v in r.items() if k != MOCK_FLAG} for r in rows]
     real_m2, mock_m2 = split_real_and_mock(stripped)
-    m2_detected = (len(mock_m2) == 0 and len(real_m2) == len(rows))
     check("M2 变异：抹掉 is_mock 标记 → 这些行会进入写集（证明标记承重）",
-          m2_detected, f"real={len(real_m2)} mock={len(mock_m2)}")
+          len(mock_m2) == 0 and len(real_m2) == len(rows),
+          f"real={len(real_m2)} mock={len(mock_m2)}")
 
-    # M3「is_mock 只看顶层」→ 嵌套形态漏检（证明嵌套分支承重、被断言依赖）
     nested = {"fields": {MOCK_FLAG: True, "site_code": "xinhua"}}
-    top_level_only = (nested.get(MOCK_FLAG) is True)   # 只看顶层 → False（漏检）
     check("M3 变异：is_mock_record 对嵌套标记返回 True，仅顶层检查会漏检（嵌套分支承重）",
-          is_mock_record(nested) is True and top_level_only is False,
-          f"nested_detected={is_mock_record(nested)} top_only={top_level_only}")
+          is_mock_record(nested) is True and (nested.get(MOCK_FLAG) is True) is False,
+          f"nested={is_mock_record(nested)}")
 
 
-def test_pipeline_wiring():
-    """(F) 接线锁：锁只有在**被生产写入层实际调用**时才有意义。
+def test_pipeline_and_endpoint_wiring():
+    """[F] 接线锁：pipeline 与 enhanced_collection 都必须真的过滤 mock。"""
+    print("\n[F] 接线锁：写路径确实调用过滤")
 
-    `split_real_and_mock` 若只是躺在 mock_utils 里、而 `collection_pipeline.py`
-    仍把原始 `result["news"]` 直接写进 `feishu_records`，则线上写集根本没走这把锁。
-    这里用**源文件扫描**做接线断言（该脚本无法离线跑：依赖飞书凭据与外网）。
-    """
-    print("\n[F] 接线锁：写入层确实调用了 split_real_and_mock / 站点级检测器")
+    with open(os.path.join(ROOT, "script", "collection_pipeline.py"), encoding="utf-8") as f:
+        pipe = f.read()
+    check("[F] collection_pipeline.py 导入并调用 split_real_and_mock",
+          "split_real_and_mock" in pipe and "split_real_and_mock(" in pipe,
+          "写入层未接入 mock 拆分")
+    check("[F] collection_pipeline.py 使用站点级检测器 get_available_sites()",
+          "get_available_sites()" in pipe, "缺少站点级检测器")
 
-    pipe_path = os.path.join(ROOT, "script", "collection_pipeline.py")
-    with open(pipe_path, encoding="utf-8") as f:
-        src = f.read()
+    with open(os.path.join(ROOT, "app", "api", "v1", "endpoints", "enhanced_collection.py"),
+              encoding="utf-8") as f:
+        ec = f.read()
+    check("[N1:F] enhanced_collection 导入并调用 is_mock_record 过滤",
+          "from app.services.collection.mock_utils import is_mock_record" in ec
+          and "is_mock_record(news_item)" in ec,
+          "第二条写入路径未过滤 mock")
+    check("[N1:F] 过滤发生在重建 feishu_record 之前（避免标记被洗白）",
+          ec.index("is_mock_record(news_item)") < ec.index("feishu_record = {"),
+          "过滤点在重建之后 → 标记会被洗白")
 
-    check("[F] collection_pipeline.py 导入了 split_real_and_mock",
-          "split_real_and_mock" in src,
-          "写入层未导入 mock 拆分函数 → 锁形同虚设")
 
-    check("[F] collection_pipeline.py 实际调用了 split_real_and_mock(",
-          "split_real_and_mock(" in src,
-          "仅导入未调用")
+def test_n2_xiaohongshu_marker_based():
+    """[G] N2：xiaohongshu._is_mock_data 必须基于标记；真实路径不被替换。"""
+    print("\n[G] N2：xiaohongshu 判定改为基于显式标记")
 
-    check("[F] collection_pipeline.py 使用了站点级检测器 get_available_sites()",
-          "get_available_sites()" in src,
-          "缺少『哪些站缺席』的站点级检测器")
+    xhs_cls = _load_site_class("xiaohongshu")
+    xhs = xhs_cls("xiaohongshu", {"timeout": 10})
 
-    check("[F] collection_pipeline.py 差额>0 时不出现『成功』文案分支",
-          "部分写入" in src and "采集任务执行成功，更新" in src,
-          "差额>0 抑制『成功』文案的改写缺失")
+    # 真实批次：首条标题恰好含「示例」→ 旧启发式会误判 → 丢整批真实数据
+    real_batch = [{"id": "r1", "title": "示例代码：从零复现", "url": "https://x/1",
+                   "hot": "9999", "rank": "1", "site_code": "xiaohongshu"}]
+    check("[G] N2：真实批次（首条标题含『示例』）**不**被判为 mock（消除误伤）",
+          xhs._is_mock_data(real_batch) is False,
+          f"_is_mock_data={xhs._is_mock_data(real_batch)}")
+
+    mock_batch = xhs._get_mock_data()
+    check("[G] N2：带标记的 mock 批次被判为 mock",
+          xhs._is_mock_data(mock_batch) is True,
+          f"_is_mock_data={xhs._is_mock_data(mock_batch)}")
+
+    stripped = [{k: v for k, v in m.items() if k != MOCK_FLAG} for m in mock_batch]
+    check("[G] N2 变异：抹掉标记后不再判为 mock（证明判定基于标记而非标题）",
+          xhs._is_mock_data(stripped) is False,
+          f"抹标记后 _is_mock_data={xhs._is_mock_data(stripped)}")
+
+    # 真实路径行为：collect() 首条含「示例」仍返回真实批次（:49-52 包装逻辑不变）
+    async def _fake_web():
+        return [dict(r) for r in real_batch]
+
+    xhs._collect_via_web = _fake_web
+    out = asyncio.run(xhs.collect({}))
+    titles = [r.get("fields", {}).get("title") for r in out]
+    check("[G] N2 真实路径：collect() 返回**真实**批次（未被替换成 mock）",
+          titles == ["示例代码：从零复现"], f"titles={titles}")
+    check("[G] N2 真实路径：输出为 {'fields': item} 且无 is_mock 标记",
+          all(isinstance(r, dict) and "fields" in r for r in out)
+          and all(not is_mock_record(r) for r in out),
+          f"out[0]={out[0] if out else 'N/A'}")
+
+    # mock 路径：网页为空 → 返回带标记的 mock
+    async def _fake_empty():
+        return []
+
+    xhs._collect_via_web = _fake_empty
+    out2 = asyncio.run(xhs.collect({}))
+    check("[G] N2 mock 路径：collect() 返回带标记的 mock（可被写入层剔除）",
+          len(out2) > 0 and all(is_mock_record(r) for r in out2),
+          f"out2={out2}")
 
 
 def main():
     print("=" * 70)
-    print("mock 治理回归锁（离线）：标记 / 剔除 / 泄漏关闭 / 变异对照 / 接线")
+    print("mock 治理回归锁（离线，动态枚举）：标记 / 剔除 / 泄漏关闭 / 变异 / 接线 / N1 / N2")
     print("=" * 70)
 
-    test_mock_marker_and_exclusion()
+    test_ban_on_wrapping()
+    test_dynamic_enumeration()
     test_xinhua_parse_path_leak_closed()
     test_real_records_unaffected()
     test_mutation_controls()
-    test_pipeline_wiring()
+    test_pipeline_and_endpoint_wiring()
+    test_n2_xiaohongshu_marker_based()
 
     print("=" * 70)
     print(f"结果: {len(PASSED)} 通过 / {len(FAILED)} 失败")

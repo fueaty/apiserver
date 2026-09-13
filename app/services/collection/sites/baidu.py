@@ -10,6 +10,10 @@ from .base import BaseSite
 from bs4 import BeautifulSoup
 # 使用新的ID生成工具
 from ....utils.id_generator import generate_content_id
+# mock 行的显式标记（见 app/services/collection/mock_utils.py）。
+# 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
+# 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
+from ..mock_utils import MOCK_FLAG
 
 
 class BaiduSite(BaseSite):
@@ -126,7 +130,12 @@ class BaiduSite(BaseSite):
         return formatted_results
     
     def _get_mock_data(self) -> List[Dict[str, Any]]:
-        """获取模拟数据（用于演示或备用）"""
+        """获取模拟数据（用于演示或备用）。
+
+        ⚠️ 演示数据**绝不允许进入飞书表**。标记必须落在 **item 内部**：
+        本函数返回的是 {"fields": item} 包装体，`is_mock_record` 会查内层
+        `fields.is_mock`，故内层标记在包装后仍被识别、被写入层排除。
+        """
         mock_data = [
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -136,7 +145,8 @@ class BaiduSite(BaseSite):
                 'rank': '1',
                 'published_at': '2024-01-01 09:00:00',
                 'collected_at': self._get_current_time(),
-                'site_code': self.site_code
+                'site_code': self.site_code,
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             },
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -146,7 +156,8 @@ class BaiduSite(BaseSite):
                 'rank': '2',
                 'published_at': '2024-01-01 08:30:00',
                 'collected_at': self._get_current_time(),
-                'site_code': self.site_code
+                'site_code': self.site_code,
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             }
         ]
         

@@ -8,6 +8,10 @@ from datetime import datetime
 from .base import BaseSite
 # 导入统一的ID生成函数
 from ....utils.id_generator import generate_content_id
+# mock 行的显式标记（见 app/services/collection/mock_utils.py）。
+# 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
+# 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
+from ..mock_utils import MOCK_FLAG
 
 
 class CctvSite(BaseSite):
@@ -129,7 +133,12 @@ class CctvSite(BaseSite):
         return hot_data
     
     def _get_mock_data(self) -> List[Dict[str, Any]]:
-        """获取模拟数据（用于演示或备用）"""
+        """获取模拟数据（用于演示或备用）。
+
+        ⚠️ 演示数据**绝不允许进入飞书表**。每条显式打 `is_mock=True` 标记：
+        本函数返回**扁平**行，collect() 在 format=='feishu' 时再包成
+        {"fields": item} —— 故标记落在**内层 dict**，包装后仍被 is_mock_record 识别。
+        """
         return [
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -143,7 +152,8 @@ class CctvSite(BaseSite):
                 'category': '示例分类',
                 'content': '这是央视新闻的示例内容',
                 'author': '央视新闻',
-                'status': 'collected'
+                'status': 'collected',
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             },
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -157,6 +167,7 @@ class CctvSite(BaseSite):
                 'category': '时政',
                 'content': '这是央视时政新闻的示例内容',
                 'author': '央视新闻',
-                'status': 'collected'
+                'status': 'collected',
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             }
         ]

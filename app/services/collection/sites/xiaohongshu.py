@@ -13,6 +13,10 @@ import yaml
 from .base import BaseSite
 # 导入统一的ID生成函数
 from ....utils.id_generator import generate_content_id
+# mock 行的显式标记 + 显式判定（见 app/services/collection/mock_utils.py）。
+# 目的：让「mock 不得入库」由**意图**保证，而不是靠标题关键词启发式（见 _is_mock_data）。
+# 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
+from ..mock_utils import MOCK_FLAG, is_mock_record
 
 
 class XiaohongshuSite(BaseSite):
@@ -690,23 +694,30 @@ class XiaohongshuSite(BaseSite):
         return results
     
     def _is_mock_data(self, data: List[Dict[str, Any]]) -> bool:
-        """判断是否为模拟数据"""
+        """判断是否为模拟数据（**基于显式 is_mock 标记**）。
+
+        历史缺陷（N2）：原实现只看 ``data[0]['title']`` 是否含「示例/Example/模拟」，
+        而 collect() 一旦判为 mock 就会**丢弃整批 web_results 并替换成 mock** ⇒
+        真实首条标题恰好命中关键词（如「示例代码」「Example」）时会**丢掉整批真实数据
+        并注入假数据**。改为基于显式标记判断：真实采集路径产出的记录**从不带标记**，
+        故零误伤；mock 则因带标记而被正确识别。
+
+        Args:
+            data: 一批记录（扁平行或 {"fields": item}；二者 is_mock_record 都支持）。
+
+        Returns:
+            只要该批**任一条**带 is_mock 标记即视为 mock（空批亦视为 mock）。
+        """
         if not data:
             return True
-        
-        # 检查数据条数
-        if len(data) < 1:  # 改为1条即可，更宽松的判断
-            return True
-            
-        first_item = data[0]
-        title = first_item.get('title', '') if isinstance(first_item, dict) else ''
-        # 检查是否包含示例相关的关键词
-        is_mock = '示例' in title or 'Example' in title or '模拟' in title
-        #print(f"检查是否为模拟数据: {is_mock}, 标题: {title}")
-        return is_mock
-    
+        return any(is_mock_record(item) for item in data)
+
     def _get_mock_data(self) -> List[Dict[str, Any]]:
-        """获取模拟数据（用于演示或备用）"""
+        """获取模拟数据（用于演示或备用）。
+
+        ⚠️ 演示数据**绝不允许进入飞书表**。标记落在 **item 内部**：
+        collect() 会把 mock 包成 {"fields": item}，故 is_mock_record 需在内层命中。
+        """
         return [
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -716,7 +727,8 @@ class XiaohongshuSite(BaseSite):
                 'rank': '1',
                 'published_at': '2024-01-01 09:00:00',
                 'collected_at': self._get_current_time(),
-                'site_code': self.site_code
+                'site_code': self.site_code,
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             },
             {
                 'id': generate_content_id(),  # 使用统一的ID生成函数
@@ -726,6 +738,7 @@ class XiaohongshuSite(BaseSite):
                 'rank': '2',
                 'published_at': '2024-01-01 08:30:00',
                 'collected_at': self._get_current_time(),
-                'site_code': self.site_code
+                'site_code': self.site_code,
+                MOCK_FLAG: True,  # mock 显式标记，禁止入库
             }
         ]

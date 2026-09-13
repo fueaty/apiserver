@@ -9,6 +9,9 @@ import asyncio
 import sys
 
 from app.services.collection.engine import CollectionEngine
+# mock 治理：本端点是**第二条**直写 headlines 的路径（batch_add_records），
+# 绕过 script/collection_pipeline.py 的 split_real_and_mock —— 必须自行剔除 mock。
+from app.services.collection.mock_utils import is_mock_record
 from app.services.selection.engine import SelectionEngine
 from app.services.feishu.feishu_service import FeishuService
 from app.api.v1.endpoints.auth import verify_token
@@ -65,6 +68,7 @@ async def collect_and_store(
         # 过滤空结果并优化数据格式
         optimized_results = []
         feishu_records = []
+        mock_skipped = 0
         for result in results:
             if result and result.get("news"):
                 # 优化数据格式，便于选材引擎直接使用
@@ -77,6 +81,14 @@ async def collect_and_store(
                 
                 # 转换新闻数据格式，增加字段处理
                 for news_item in result["news"]:
+                    # —— mock 治理（本路径无 pipeline 的 split_real_and_mock，须自行剔除）——
+                    # 本端点调用同一个 CollectionEngine，会走各站的 _get_mock_data() 回退；
+                    # 过滤必须发生在**按固定键重建 feishu_record 之前**——重建只保留白名单键，
+                    # 会把 is_mock 标记洗白（与 xinhua.py 解析路径同类陷阱），使 mock 静默入库。
+                    if is_mock_record(news_item):
+                        mock_skipped += 1
+                        continue
+
                     # 提取fields中的字段
                     fields = news_item.get("fields", {})
                     
@@ -144,6 +156,13 @@ async def collect_and_store(
                 
                 optimized_results.append(optimized_result)
         
+        if mock_skipped:
+            logger.warning(
+                "采集并存储：已从写集与选材中排除 %d 条 mock 演示数据（未入库）。"
+                "本路径无 pipeline 的 split_real_and_mock，故在重建记录前按 is_mock 标记过滤。",
+                mock_skipped,
+            )
+
         logger.info(f"采集任务完成，共采集 {len(optimized_results)} 个站点，{sum(len(r['news']) for r in optimized_results)} 条新闻")
         
         # 存储到飞书多维表格
