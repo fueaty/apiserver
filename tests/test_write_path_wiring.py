@@ -26,6 +26,14 @@
     python tests/test_write_path_wiring.py     # 期望 RC=0
 """
 
+# --- 鉴别力定位（勿省跑；据 qa-verifier-2 突变对照）----------------------------
+# 本套件是「模块在、行为退回」两类突变的**唯一守卫**：其余 4 套件（断言数 65/43/9/15）
+# 在这两类突变下全绿 ⇒ 发布门禁**不得省跑**本文件。
+# 但 G2（`continue`→`pass`）的实际检出**只落在** [2] 的「条数」「标题等值」两条断言上：
+# `build_headline_records` 按**固定白名单键**重建 dict，`is_mock` 不在白名单 ⇒ 标记被**洗白**，
+# 故所有 `is_mock`/mock 类断言对 G2 **结构性失明**。改 [2] 时务必保住那两条。
+# ---------------------------------------------------------------------------
+
 import asyncio
 import datetime
 import importlib
@@ -246,10 +254,12 @@ def test_build_headline_records_behavior():
     check("[2] mock_skipped 计数 == 2", skipped == 2, f"skipped={skipped}")
     check("[2] feishu_records 里 mock==0", len([r for r in records if is_mock_record(r)]) == 0,
           f"records={records!r}")
+    # G2(continue→pass) 的唯一检出点：mock 标记会被 build_headline_records 按白名单键重建时洗白，删弱/改写这两条 = 对 G2 失明，勿删。
     check("[2] feishu_records 条数 == 真实行 2 条", len(records) == 2, f"len={len(records)}")
     check("[2] optimized.news 里 mock==0",
           len([n for n in optimized[0]["news"] if is_mock_record(n)]) == 0,
           f"optimized={optimized!r}")
+    # G2(continue→pass) 的唯一检出点：mock 标记会被 build_headline_records 按白名单键重建时洗白，删弱/改写这两条 = 对 G2 失明，勿删。
     check("[2] 真实标题被保留（真实1、真实3）",
           sorted(r["fields"]["title"] for r in records) == ["真实1", "真实3"],
           f"titles={[r['fields']['title'] for r in records]}")
