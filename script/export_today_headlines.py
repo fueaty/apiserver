@@ -20,9 +20,16 @@ import app.wework.notification_push as notification_push
 
 today = datetime.now().strftime("%Y-%m-%d")
 
-async def export_today_headlines_to_json(output_file: str = "today_headlines_data.json"):
+async def export_today_headlines_to_json(output_file: str = None):
     """导出飞书多维表格中今天采集的数据到JSON文件"""
     try:
+        # 如果没有指定输出文件，则使用默认命名规则保存到上级目录
+        if output_file is None:
+            output_file = f"../{today}_headlines_data.json"
+        elif not os.path.isabs(output_file) and not output_file.startswith("../"):
+            # 如果是相对路径且不是以../开头，则加上../前缀
+            output_file = f"../{output_file}"
+        
         # 初始化飞书服务
         feishu_service = FeishuService()
         
@@ -40,6 +47,7 @@ async def export_today_headlines_to_json(output_file: str = "today_headlines_dat
         print(f"📱 正在从飞书多维表格获取数据...")
         print(f"   App Token: {app_token}")
         print(f"   Table ID: {table_id}")
+        print(f"   输出文件: {output_file}")
         print(f"   筛选日期: {today}")
         
         # 获取所有记录（使用较大的page_size以减少请求次数）
@@ -103,11 +111,18 @@ def main():
     """主函数"""
     import asyncio
     
-    output_file = f"{today}_headlines_data.json"
+    # 默认输出文件名（保存到上级目录）
+    output_file = f"../{today}_headlines_data.json"
+    
+    # 如果提供了命令行参数，则使用参数指定的文件名
     if len(sys.argv) > 1:
         output_file = sys.argv[1]
+        # 处理相对路径，确保输出到上级目录
+        if not os.path.isabs(output_file) and not output_file.startswith("../"):
+            output_file = f"../{output_file}"
     
     print("🚀 开始导出今天采集的数据...")
+    print(f"   输出文件: {output_file}")
     success = asyncio.run(export_today_headlines_to_json(output_file))
     
     if success:
