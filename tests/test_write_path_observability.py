@@ -147,7 +147,7 @@ def test_batch_update_observability():
 # (2) records_to_delete 去重（源锁）
 # ---------------------------------------------------------------------------
 def test_records_to_delete_dedup():
-    print("\n[2] collection_pipeline.py：records_to_delete 去重（接线锁）")
+    print("\n[2] collection_pipeline.py：records_to_delete 去重（接线锁 + 操作数锁）")
 
     with open(os.path.join(ROOT, "script", "collection_pipeline.py"), encoding="utf-8") as f:
         src = f.read()
@@ -156,9 +156,20 @@ def test_records_to_delete_dedup():
           "list(dict.fromkeys(records_to_delete))" in src,
           "未去重 → 删除接口会收到重复 id、对账无法闭合")
 
-    check("[2] 去重：同时打印『列表长度』与『唯一 id 数』",
-          "delete_len_raw" in src and "去重后唯一" in src,
-          "两个数缺一 → 残差无法定位")
+    # 【操作数锁】不能只断言「两个数都出现」——那对「主语用错量」这种缺陷视而不见。
+    # operator 拿这句话去对账时，紧跟『需要删除』后面的数才是**操作数**，必须来自
+    # 去重后的唯一 id 数 len(records_to_delete)；若退回 delete_len_raw（列表长度），
+    # 等于把「列表长度 = 要删的条数」这个**错误前提**重新写进输出（正是本修复要消灭的混淆）。
+    import re as _re
+    m = _re.search(r"需要删除 \{([^}]+)\} 条已存在记录", src)
+    operand = m.group(1).strip() if m else None
+    check("[2] 操作数锁：『需要删除』主语的量 == len(records_to_delete)（非 delete_len_raw）",
+          operand == "len(records_to_delete)",
+          f"实际主语={operand!r}（应为 'len(records_to_delete)'）")
+
+    check("[2] 入站 raw 数保留为**诊断值**（仍出现，但不是主语）",
+          "delete_len_raw" in src and operand != "delete_len_raw",
+          f"raw_in_src={'delete_len_raw' in src} operand={operand!r}")
 
 
 # ---------------------------------------------------------------------------
