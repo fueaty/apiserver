@@ -125,8 +125,15 @@ class ThepaperSite(BaseSite):
             # 确保session被正确关闭
             if session:
                 await session.close()
-                
-        return results
+
+        # ⚠️ 返回前**无条件**截断（幂等）；放在 except 之后是关键：
+        # 上面的「去重 + 排序 + 热度重算」整块躺在 try 里。一旦
+        #   results.sort(key=lambda x: int(x.get('hot', 0))) 遇到非数字 hot → ValueError，或
+        #   item['hot'] 缺键 → KeyError，
+        # 异常会被上面的 except 吞掉；若不在此处兜底，就会返回**未经截断的全量列表**。
+        # MAX_RESULTS 是 limits.py 容量预算里 thepaper 的硬上界（DAILY_BUDGET 的输入），
+        # 「被守卫依赖的上界」不能带“异常时静默失效”的分支，故 return 前必定再截一次。
+        return results[:MAX_RESULTS]
     
     def _parse_category_page(self, html_text: str, category_url: str) -> List[Dict[str, Any]]:
         """解析澎湃新闻分类页面内容"""
