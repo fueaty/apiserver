@@ -250,7 +250,7 @@ class SelectionEngine:
         
         # 生成内容角度和推荐策略
         content_angle = self._generate_content_angle(hotspot, platform_config)           # 内容创作角度
-        recommended_strategy = self._recommend_strategy(hotspot, platform_config)        # 推荐的内容策略
+        recommended_strategy = self._recommend_strategy(hotspot, platform_config, platform)  # 推荐的内容策略
         
         # 生成推荐理由
         reason = self._generate_recommendation_reason_simple(score, breakdown)
@@ -380,7 +380,7 @@ class SelectionEngine:
                     "site_code": hotspot.get("site_code"),
                     "total_score": round(score, 2),
                     "content_angle": self._generate_content_angle(hotspot, platform_config),
-                    "recommended_strategy": self._recommend_strategy(hotspot, platform_config),
+                    "recommended_strategy": self._recommend_strategy(hotspot, platform_config, platform),
                     "reason": self._generate_recommendation_reason_simple(score, breakdown),
                     "detailed_scores": breakdown
                 }
@@ -417,27 +417,32 @@ class SelectionEngine:
         else:
             return f"热点解读：{title}的关键信息梳理"       # 通用热点解读
     
-    def _recommend_strategy(self, hotspot: Dict[str, Any], platform_config: Dict[str, Any]) -> str:
+    def _recommend_strategy(self, hotspot: Dict[str, Any], platform_config: Dict[str, Any],
+                            platform_code: Optional[str] = None) -> str:
         """
         推荐内容策略
         根据平台特点推荐合适的内容创作策略
-        
-        参数:
-        - hotspot: 热点数据
-        - platform_config: 平台配置
-        
-        返回:
-        - 推荐策略名称
+
+        ⚠️ 注意：platform_config 传入的是 platforms.yaml 中该平台的 `selection_rules` 子块，
+        **里面没有 `name` 字段**（`name` 在 selection_rules 的上一级）。
+        历史实现读 `platform_config.get("name", "")` 永远取到空字符串，
+        导致**所有平台都返回「快速资讯策略」**，平台差异化形同失效。
+
+        修正：优先按平台 code 匹配 self.content_strategies[*].applicable_platforms
+        （这才是 content_strategies 这张表的设计意图），再回退到内容风格关键词。
         """
-        
-        platform_name = platform_config.get("name", "")  # 平台名称
-        
-        # 基于平台推荐策略
-        if "小红书" in platform_name:
-            return "情感共鸣策略"      # 小红书适合情感类内容
-        elif "知乎" in platform_name:
-            return "知识分享策略"      # 知乎适合知识类内容
-        elif "头条" in platform_name or "微博" in platform_name:
-            return "趋势分析策略"      # 头条微博适合趋势类内容
-        else:
-            return "快速资讯策略"      # 其他平台适合快速资讯
+        # 1) 按平台 code 精确匹配预置策略表
+        if platform_code:
+            for strategy in self.content_strategies.values():
+                if platform_code in strategy.get("applicable_platforms", []):
+                    return strategy.get("strategy_name", "快速资讯策略")
+
+        # 2) 回退：按内容风格关键词推断
+        style = platform_config.get("content_style", "")
+        if any(k in style for k in ("情感", "视觉", "共鸣")):
+            return "情感共鸣策略"
+        if any(k in style for k in ("专业", "深度", "权威", "知识")):
+            return "知识分享策略"
+        if any(k in style for k in ("趋势", "时效", "快速")):
+            return "趋势分析策略"
+        return "快速资讯策略"

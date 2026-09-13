@@ -25,23 +25,36 @@ class PublicationManager:
         self.feishu_service = FeishuService()
         
     def _load_platforms_config(self) -> Dict[str, Any]:
-        """加载平台配置"""
+        """加载平台配置
+
+        ⚠️ config/platforms.yaml 的顶层键是 `publish_platforms`（不是 `platforms`）。
+        历史上这里读的是 "platforms"，永远取到空 dict，导致静默退化成
+        只含 zhihu 的最小 fallback（缺 request/constraints/selection_rules），
+        进而让 zhihu.py 读 platform_config['request']['url'] 时 KeyError。
+
+        为兼容可能存在的老配置，仍回退读 "platforms"；两者都空才用最小 fallback。
+        """
         config_path = settings.PLATFORMS_CONFIG_FILE
         config_data = load_yaml_config(config_path)
-        platforms_config = config_data.get("platforms", {}) if isinstance(config_data, dict) else {}
-        
+        if not isinstance(config_data, dict):
+            config_data = {}
+
+        platforms_config = config_data.get("publish_platforms") or config_data.get("platforms") or {}
+
         if not platforms_config:
-            logger.warning("平台配置为空，将使用默认配置")
+            logger.warning(
+                "平台配置为空（已尝试 publish_platforms / platforms 两个键），将使用默认配置"
+            )
             platforms_config = {
                 "zhihu": {
                     "enabled": True,
                     "rate_limit": 10,
-                    "timeout": 15
+                    "timeout": 15,
                 }
             }
-        
+
         return platforms_config
-    
+
     async def publish(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         执行内容发布
@@ -103,8 +116,10 @@ class PublicationManager:
             )
             
             # 8. 将发布结果存储到飞书表格
-            if result['success']:
-                await self._store_publish_result_to_feishu(platform_code, content, result)
+            # 需求①(R1-4)：无论成功失败都落库。函数体内部已按 result['success']
+            # 决定 task_status / publish_result，失败时写入 error_message；
+            # 若仍用 `if result['success']` 挡住，失败原因将永远为空，排障只能翻日志。
+            await self._store_publish_result_to_feishu(platform_code, content, result)
             
             return self._format_response(final_result, platform_config)
             
@@ -230,19 +245,48 @@ class PlatformFactory:
             spec = importlib.util.spec_from_file_location(f"platforms.{platform_code}", platform_file)
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            
-            # 查找平台类（约定类名为 {PlatformCode}Platform）
-            platform_class_name = f"{platform_code.capitalize()}Platform"
+
+            # 查找平台类（约定类名为 {PascalCase}Platform）
+            # ⚠️ 不能用 str.capitalize()：它只大写首字母，
+            # "wechat_public".capitalize() == "Wechat_public"，
+            # 拼出 "Wechat_publicPlatform" 永远取不到类。
+            # 正确做法是按 "_" 分段后各段首字母大写 → "WechatPublicPlatform"。
+            pascal_code = "".join(part.capitalize() for part in platform_code.split("_"))
+            platform_class_name = f"{pascal_code}Platform"
             platform_class = getattr(module, platform_class_name, None)
-            
+
+            # 兜底：命名约定不匹配时，扫描模块内唯一的 BasePlatform 子类
+            if platform_class is None:
+                platform_class = self._find_platform_class(module)
+                if platform_class is not None:
+                    logger.warning(
+                        f"平台模块 {platform_code} 未按约定命名 {platform_class_name}，"
+                        f"已回退匹配到 {platform_class.__name__}"
+                    )
+
             if platform_class:
                 self._loaded_platforms[platform_code] = platform_class
                 logger.info(f"成功加载平台模块: {platform_code}")
             else:
                 logger.warning(f"平台模块中未找到类: {platform_class_name}")
-                
+
         except Exception as e:
             logger.error(f"加载平台模块失败: {platform_code}, 错误: {str(e)}")
+
+    @staticmethod
+    def _find_platform_class(module):
+        """在模块中查找继承自 BasePlatform 的类（命名约定失配时的兜底）"""
+        from app.services.publication.platforms.base import BasePlatform
+
+        candidates = [
+            obj for name, obj in vars(module).items()
+            if isinstance(obj, type)
+            and issubclass(obj, BasePlatform)
+            and obj is not BasePlatform
+            and getattr(obj, "__module__", None) == module.__name__
+        ]
+        # 仅在唯一命中时返回，避免多实现时产生歧义
+        return candidates[0] if len(candidates) == 1 else None
 
 
 class PluginManager:

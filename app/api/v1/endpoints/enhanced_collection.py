@@ -14,6 +14,11 @@ from app.services.feishu.feishu_service import FeishuService
 from app.api.v1.endpoints.auth import verify_token
 from app.utils.logger import logger
 from app.core.config import config_manager
+from app.utils.hotspot_enrich import (
+    categorize_content,
+    extract_keywords,
+    parse_hot_value,
+)
 from app.services.feishu.field_rules import TABLE_PLANS
 
 
@@ -128,6 +133,9 @@ async def collect_and_store(
                             "hot": str(int(float(fields.get("hot").replace('万', '')) * 10000) if isinstance(fields.get("hot"), str) and '万' in fields.get("hot") else int(fields.get("hot")) if isinstance(fields.get("hot"), (int, float)) else int(float(fields.get("hot"))) if isinstance(fields.get("hot"), str) and fields.get("hot").replace('万', '').isdigit() else 0),
                             "rank": str(int(fields.get("rank", 0)) if fields.get("rank") else 0),
                             "collected_at": result["collect_time"],
+                            # 需求①(R1-2)：published_at 已加入 TABLE_PLANS['headlines']，
+                            # 写入侧必须同步补键，否则该 dict 字段集 ≠ 表规划，字段会被丢弃。
+                            "published_at": fields.get("published_at", ""),
                             "site_code": result["site_code"],
                             "status": "collected"
                         }
@@ -230,7 +238,7 @@ async def select_and_store(
                 "hot_level": "",
                 "rank": int(fields.get("rank", 0)) if fields.get("rank") else 0,
                 "category": fields.get("category", ""),
-                "keywords": _extract_keywords(fields.get("title", "")),
+                "keywords": extract_keywords(fields.get("title", "")),
                 "collect_time": fields.get("collected_at", ""),
                 "publish_time": "",
                 "summary": fields.get("content", ""),
@@ -353,78 +361,3 @@ async def select_and_store(
                 "data": None
             }
         )
-
-
-def _extract_keywords(title: str) -> list:
-    """从标题中提取关键词"""
-    if not title:
-        return []
-    
-    import re
-    
-    # 常见停用词
-    stop_words = {"的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "那", "他", "她", "它"}
-    
-    # 提取中文关键词（2-4个字符）
-    keywords = []
-    words = re.findall(r'[\u4e00-\u9fa5]{2,4}', title)
-    
-    for word in words:
-        if word not in stop_words and word not in keywords:
-            keywords.append(word)
-    
-    return keywords[:5]  # 最多返回5个关键词
-
-
-def _categorize_content(title: str, user_category: str = None) -> str:
-    """内容分类"""
-    if user_category:
-        return user_category
-    
-    # 基于标题关键词自动分类
-    title_lower = title.lower()
-    
-    if any(keyword in title_lower for keyword in ["政治", "政府", "政策", "规划", "建议"]):
-        return "政治"
-    elif any(keyword in title_lower for keyword in ["经济", "财经", "股市", "金融", "投资"]):
-        return "经济"
-    elif any(keyword in title_lower for keyword in ["科技", "互联网", "AI", "人工智能", "技术"]):
-        return "科技"
-    elif any(keyword in title_lower for keyword in ["娱乐", "明星", "电影", "音乐", "综艺"]):
-        return "娱乐"
-    elif any(keyword in title_lower for keyword in ["体育", "足球", "篮球", "比赛", "运动员"]):
-        return "体育"
-    else:
-        return "综合"
-
-
-def _parse_hot_value(hot_str):
-    """解析热度值字符串，处理包含单位的情况"""
-    if not hot_str:
-        return 0
-    
-    try:
-        # 如果是数字直接返回
-        if isinstance(hot_str, (int, float)):
-            return int(hot_str)
-        
-        # 转换为字符串处理
-        hot_text = str(hot_str).strip()
-        
-        # 处理"万"单位
-        if '万' in hot_text:
-            number = float(hot_text.replace('万', ''))
-            return int(number * 10000)
-        
-        # 处理"千"单位
-        elif '千' in hot_text:
-            number = float(hot_text.replace('千', ''))
-            return int(number * 1000)
-        
-        # 直接转换为整数
-        else:
-            return int(float(hot_text))
-            
-    except (ValueError, TypeError):
-        # 解析失败时返回默认值0
-        return 0

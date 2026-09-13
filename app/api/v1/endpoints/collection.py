@@ -10,6 +10,13 @@ import re
 from app.services.collection.engine import CollectionEngine
 from app.api.v1.endpoints.auth import verify_token
 from app.utils.logger import logger
+from app.utils.hotspot_enrich import (
+    assess_content_quality,
+    calculate_hot_level,
+    categorize_content,
+    extract_keywords,
+    generate_summary,
+)
 
 
 router = APIRouter()
@@ -72,12 +79,12 @@ async def collect_website_info(
                     
                     # 计算热度等级
                     hot_value = int(fields.get("hot", 0)) if fields.get("hot") else 0
-                    hot_level = _calculate_hot_level(hot_value)
+                    hot_level = calculate_hot_level(hot_value)
                     
                     # 提取关键词和分类
                     title = fields.get("title", "")
-                    keywords = _extract_keywords(title)
-                    content_category = _categorize_content(title, category)
+                    keywords = extract_keywords(title)
+                    content_category = categorize_content(title, category)
                     
                     # 按照飞书格式返回，包含fields字段
                     optimized_news = {
@@ -94,8 +101,8 @@ async def collect_website_info(
                             "category": content_category,
                             "keywords": keywords,
                             "collect_time": result["collect_time"],
-                            "summary": _generate_summary(title, hot_value, int(fields.get("rank", 0)) if fields.get("rank") else 0),
-                            "content_quality": _assess_content_quality(title, hot_value)
+                            "summary": generate_summary(title, hot_value, int(fields.get("rank", 0)) if fields.get("rank") else 0),
+                            "content_quality": assess_content_quality(title, hot_value)
                         }
                     }
                     optimized_result["news"].append(optimized_news)
@@ -152,86 +159,3 @@ async def get_available_sites(payload: dict = Depends(verify_token)):
                 "data": None
             }
         )
-
-
-def _calculate_hot_level(hot_value: int) -> str:
-    """计算热度等级"""
-    if hot_value >= 1000000:
-        return "爆款"
-    elif hot_value >= 500000:
-        return "热门"
-    elif hot_value >= 100000:
-        return "较热"
-    elif hot_value >= 10000:
-        return "一般"
-    else:
-        return "冷门"
-
-
-def _extract_keywords(title: str) -> list:
-    """从标题中提取关键词"""
-    if not title:
-        return []
-    
-    # 常见停用词
-    stop_words = {"的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好", "自己", "这", "那", "他", "她", "它"}
-    
-    # 提取中文关键词（2-4个字符）
-    keywords = []
-    words = re.findall(r'[\u4e00-\u9fa5]{2,4}', title)
-    
-    for word in words:
-        if word not in stop_words and word not in keywords:
-            keywords.append(word)
-    
-    return keywords[:5]  # 最多返回5个关键词
-
-
-def _categorize_content(title: str, user_category: str = None) -> str:
-    """内容分类"""
-    if user_category:
-        return user_category
-    
-    # 基于标题关键词自动分类
-    title_lower = title.lower()
-    
-    if any(keyword in title_lower for keyword in ["政治", "政府", "政策", "规划", "建议"]):
-        return "政治"
-    elif any(keyword in title_lower for keyword in ["经济", "财经", "股市", "金融", "投资"]):
-        return "经济"
-    elif any(keyword in title_lower for keyword in ["科技", "互联网", "AI", "人工智能", "技术"]):
-        return "科技"
-    elif any(keyword in title_lower for keyword in ["娱乐", "明星", "电影", "音乐", "综艺"]):
-        return "娱乐"
-    elif any(keyword in title_lower for keyword in ["体育", "足球", "篮球", "比赛", "运动员"]):
-        return "体育"
-    else:
-        return "综合"
-
-
-def _generate_summary(title: str, hot_value: int, rank: int) -> str:
-    """生成内容摘要"""
-    hot_level = _calculate_hot_level(hot_value)
-    
-    if rank == 1:
-        return f"{hot_level}内容，排名第{rank}位：{title}"
-    else:
-        return f"{hot_level}内容，当前排名第{rank}位：{title}"
-
-
-def _assess_content_quality(title: str, hot_value: int) -> dict:
-    """评估内容质量"""
-    # 基于标题长度和热度评估质量
-    title_length = len(title)
-    
-    quality_score = min(10, (title_length / 20) + (min(hot_value, 1000000) / 100000))
-    
-    return {
-        "score": round(quality_score, 2),
-        "level": "优质" if quality_score >= 7 else "良好" if quality_score >= 5 else "一般",
-        "factors": [
-            f"标题长度：{title_length}字符",
-            f"热度值：{hot_value}",
-            "内容完整性：待分析"
-        ]
-    }

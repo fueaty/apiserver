@@ -7,7 +7,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 import lark_oapi as lark
 from lark_oapi.api.bitable.v1 import *
 from ...core.config import config_manager
-from .field_rules import FIELD_DEFINITIONS, REQUIRED_FIELDS
+from .field_rules import BASE_FIELD_DEFINITIONS, REQUIRED_FIELDS
 from .limits import (
     TABLE_RECORD_LIMIT,
     BATCH_WRITE_LIMIT,
@@ -21,6 +21,7 @@ from .limits import (
 # API URL 常量
 FEISHU_TENANT_ACCESS_TOKEN_URL = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
 FEISHU_BITABLE_RECORDS_BATCH_CREATE_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_create"
+FEISHU_BITABLE_RECORDS_BATCH_UPDATE_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_update"
 FEISHU_BITABLE_RECORDS_BATCH_DELETE_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete"
 FEISHU_BITABLE_FIELDS_LIST_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields"
 FEISHU_BITABLE_FIELD_DELETE_URL = "https://open.feishu.cn/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}"
@@ -392,7 +393,11 @@ class FeishuService:
             # 添加缺失字段
             for field_name in fields_to_add:
                 try:
-                    field_def = FIELD_DEFINITIONS.get(field_name, {})
+                    # ⚠️ 必须查 BASE_FIELD_DEFINITIONS（键=字段名）。
+                    # 历史上这里查的是 FIELD_DEFINITIONS（键=表类型：headlines/…），
+                    # 永远取不到值 → 退化成 field_type='text'。当前所有定义恰好都是
+                    # text 才没暴露问题，属于潜伏 bug（一旦新增 number/date 字段就失效）。
+                    field_def = BASE_FIELD_DEFINITIONS.get(field_name, {})
                     field_type = field_def.get('type', 'text')
                     property_config = field_def.get('property', {})
                     
@@ -553,6 +558,133 @@ class FeishuService:
             "code": 0,
             "msg": "success",
             "data": {"records": created_records},
+        }
+
+    async def batch_update_records(self, app_token: str, table_id: str,
+                                   records: list, align: bool = False) -> dict:
+        """
+        按 record_id 更新飞书记录（唯一收口，需求②回写 / 幂等更新用）。
+
+        ⚠️ 三种同族接口的请求体形状【极易搞混，禁止照抄】：
+          - batch_add_records   : {"records": [{"fields": {...}}]}                    # 无 record_id
+          - batch_update_records: {"records": [{"record_id":"rec1","fields":{...}}]}  # 本方法（对象数组）
+          - batch_delete        : {"records": ["rec1","rec2"]}                        # 纯字符串数组
+            历史教训：曾把 batch_delete 写成对象数组 → HTTP 400（且无明确报错）
+            → “计划删 19823 条、实际 0 条”，表被卡在 20,000 上限数月。
+
+        与 batch_add_records 的差异：本方法**只更新、不新增**（因此不会产生重复行），
+        每条记录必须携带 ``record_id``。
+
+        Args:
+            app_token: 多维表格应用 token
+            table_id: 数据表 id
+            records: 对象数组 ``[{"record_id": "recXXXX", "fields": {...}}, ...]``
+            align: True 时先按线上字段过滤 fields（语义同 batch_add_records）
+
+        Returns:
+            {"code": 0, "msg": "success",
+             "data": {"records": [...], "updated": <实际成功条数>}}
+            全部分片失败时 code 非 0，但仍回传 data.updated 供调用方精确判断。
+
+        分片：按 limits.BATCH_WRITE_LIMIT(500) 切片，片间 ``await asyncio.sleep(0.3)``
+              规避 1254291 Write conflict。**单分片失败不中断后续分片**。
+        令牌：``await self.get_tenant_access_token()``（与既有方法一致）。
+        """
+        # 规范化：仅保留携带 record_id 的对象
+        normalized: List[Dict[str, Any]] = []
+        for rec in records or []:
+            if not isinstance(rec, dict):
+                continue
+            record_id = rec.get("record_id")
+            if not record_id:
+                continue
+            fields = rec.get("fields") or {}
+            normalized.append({"record_id": record_id, "fields": fields})
+
+        if not normalized:
+            return {"code": 0, "msg": "success", "data": {"records": [], "updated": 0}}
+
+        token = await self.get_tenant_access_token()
+
+        # 可选：按线上字段过滤（与 batch_add_records 的 align 语义一致）
+        if align:
+            table_fields_info = await self.get_table_fields_uncached(app_token, table_id)
+            table_fields_set = set(table_fields_info.keys())
+            normalized = [
+                {
+                    "record_id": rec["record_id"],
+                    "fields": {
+                        name: value
+                        for name, value in rec["fields"].items()
+                        if name in table_fields_set
+                    },
+                }
+                for rec in normalized
+            ]
+
+        url = FEISHU_BITABLE_RECORDS_BATCH_UPDATE_URL.format(
+            app_token=app_token, table_id=table_id
+        )
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        }
+
+        total = len(normalized)
+        updated_records: List[dict] = []
+        updated = 0
+        ok_chunks = 0
+        failed_chunks = 0
+        last_code = 0
+        last_msg = "success"
+
+        async with httpx.AsyncClient() as client:
+            for start in range(0, total, BATCH_WRITE_LIMIT):
+                chunk = normalized[start:start + BATCH_WRITE_LIMIT]
+                chunk_no = start // BATCH_WRITE_LIMIT + 1
+                # 对象数组（含 record_id）—— 不要改成纯字符串数组（那是 batch_delete）
+                payload = {"records": chunk}
+
+                try:
+                    response = await client.post(url, headers=headers, json=payload, timeout=30)
+                    response.raise_for_status()
+                    result = response.json()
+                except Exception as exc:
+                    failed_chunks += 1
+                    last_code = -1
+                    last_msg = f"第 {chunk_no} 批更新异常: {exc}"
+                    print(f"[ERROR] {last_msg}")
+                    if start + BATCH_WRITE_LIMIT < total:
+                        await asyncio.sleep(0.3)
+                    continue
+
+                if result.get("code") == 0:
+                    ok_chunks += 1
+                    chunk_records = result.get("data", {}).get("records", []) or []
+                    updated_records.extend(chunk_records)
+                    updated += len(chunk_records) if chunk_records else len(chunk)
+                else:
+                    failed_chunks += 1
+                    last_code = result.get("code")
+                    last_msg = result.get("msg")
+                    print(f"[ERROR] 第 {chunk_no} 批更新失败: "
+                          f"code={last_code} msg={last_msg}")
+
+                if start + BATCH_WRITE_LIMIT < total:
+                    await asyncio.sleep(0.3)
+
+        # 全部分片都失败：code 非 0（但仍回传 data.updated 供精确判断）
+        if failed_chunks and not ok_chunks:
+            return {
+                "code": last_code if last_code else -1,
+                "msg": last_msg,
+                "data": {"records": updated_records, "updated": updated},
+            }
+
+        return {
+            "code": 0,
+            "msg": "success",
+            "data": {"records": updated_records, "updated": updated},
         }
 
     # ------------------------------------------------------------------

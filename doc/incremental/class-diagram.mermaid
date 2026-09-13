@@ -1,0 +1,97 @@
+classDiagram
+    class ContentExtractor {
+        +extract(html: str, selector: Optional[str]) ExtractResult
+        +_strip(html: str) str
+        +normalize_text(s: str) str
+        +match_selector(tag, attrs, selector) bool
+    }
+    class ExtractResult {
+        +text: str
+        +extractor: str
+        +matched: bool
+    }
+    class ContentFetcher {
+        -extractor: ContentExtractor
+        -robots: RobotsTxtChecker
+        -http_getter: Callable
+        -max_concurrency: int
+        -default_timeout: int
+        +fetch_one(item: FetchItem, timeout: Optional[int]) FetchOutcome
+        +fetch_many(items: List~FetchItem~, concurrency, timeout) List~FetchOutcome~
+        +infer_site_code(url: str) Optional~str~
+    }
+    class FetchItem {
+        +url: str
+        +record_id: Optional~str~
+        +site_code: Optional~str~
+    }
+    class FetchOutcome {
+        +url: str
+        +record_id: Optional~str~
+        +status: str
+        +title: Optional~str~
+        +content: Optional~str~
+        +content_length: int
+        +extractor: Optional~str~
+        +elapsed_ms: int
+        +error_code: Optional~str~
+        +error_message: Optional~str~
+        +retryable: bool
+        +written: bool
+        +to_dict() dict
+    }
+    class BaseLLMClient {
+        <<interface>>
+        +generate(prompt, temperature, max_tokens) str
+        +generate_sync(prompt, temperature, max_tokens) str
+    }
+    class OpenAICompatClient {
+        -base_url: str
+        -api_key: str
+        -model_name: str
+        -timeout: int
+        +generate(prompt, temperature, max_tokens) str
+        +generate_sync(prompt, temperature, max_tokens) str
+    }
+    class LLMMockClient {
+        +generate(prompt, temperature, max_tokens) str
+        +generate_sync(prompt, temperature, max_tokens) str
+    }
+    class LLMProcessor {
+        -config: dict
+        -llm_config: dict
+        -llm_client: BaseLLMClient
+        -llm_client_mode: str
+        +_initialize_llm_client() BaseLLMClient
+        +analyze_hotspot(hotspot: dict) dict
+    }
+    class InsightsService {
+        -feishu_service: FeishuService
+        -llm_factory: Callable
+        +preflight() dict
+        +generate(req: InsightsGenerateRequest) dict
+        -_load_headlines(record_ids, urls) List~dict~
+        -_ensure_schema_confirmed() Tuple~bool, List~str~~
+    }
+    class FeishuService {
+        +batch_add_records(app_token, table_id, records) dict
+        +batch_update_records(app_token, table_id, records, align) dict
+        +list_records(app_token, table_id, page_size, page_token) dict
+        +get_table_fields_uncached(app_token, table_id) dict
+    }
+    class ConfigManager {
+        +get_config(force_reload) dict
+        +get_credentials(force_reload) dict
+    }
+
+    ContentFetcher --> ContentExtractor : uses
+    ContentFetcher --> FetchItem : input
+    ContentFetcher ..> FetchOutcome : produces
+    ContentFetcher ..> FeishuService : 回写 batch_update_records
+    ContentExtractor ..> ExtractResult : produces
+    OpenAICompatClient ..|> BaseLLMClient
+    LLMMockClient ..|> BaseLLMClient
+    LLMProcessor --> BaseLLMClient : builds via factory
+    InsightsService --> FeishuService : read/write
+    InsightsService --> LLMProcessor : generate
+    ConfigManager ..> LLMProcessor : provide get_config()

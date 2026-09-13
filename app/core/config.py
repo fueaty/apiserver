@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     SITES_CONFIG_FILE: Path = CONFIG_DIR / "sites.yaml"
     PLATFORMS_CONFIG_FILE: Path = CONFIG_DIR / "platforms.yaml"
     CREDENTIALS_CONFIG_FILE: Path = CONFIG_DIR / "credentials.yaml"
+    # 分析特性配置（根键 feature_analysis），供 analysis/ 模块读取
+    ANALYSIS_CONFIG_FILE: Path = CONFIG_DIR / "analysis.yaml"
     
     # 安全配置
     SECRET_KEY: str = "your-secret-key-change-in-production"
@@ -92,6 +94,11 @@ class ConfigManager:
     def __init__(self):
         self._sites_config = None
         self._platforms_config = None
+        # ⚠️ 必须显式初始化为 None：否则当 credentials.yaml 不存在时
+        # _should_reload() 返回 False，get_credentials() 会在
+        # `self._credentials_config or {}` 处抛 AttributeError。
+        self._credentials_config = None
+        self._analysis_config = None
         self._last_modified = {}
         self._lock = Lock()
         
@@ -130,7 +137,28 @@ class ConfigManager:
             if force_reload or self._should_reload(settings.CREDENTIALS_CONFIG_FILE):
                 self._credentials_config = self.load_yaml_config(settings.CREDENTIALS_CONFIG_FILE)
                 self._update_last_modified(settings.CREDENTIALS_CONFIG_FILE)
+            # 文件不存在或从未加载时 self._credentials_config 为 None，兜底返回 {}
             return self._credentials_config or {}
+
+    def get_config(self, force_reload: bool = False) -> Dict[str, Any]:
+        """获取分析特性配置（config/analysis.yaml），支持热重载。
+
+        返回**整个文件内容**（根键通常为 `feature_analysis`），供 analysis/ 下的
+        调用方按 `get_config()['feature_analysis'][<子段>]` 取用；调用方全部使用
+        `.get('feature_analysis', {})` 兜底，因此文件缺失/解析失败返回 `{}` 时
+        整条链路可自然退化，不会抛异常。
+
+        Args:
+            force_reload: 为 True 时强制重新读取磁盘文件
+
+        Returns:
+            配置文件内容 dict；文件缺失或异常时返回 {}
+        """
+        with self._lock:
+            if force_reload or self._should_reload(settings.ANALYSIS_CONFIG_FILE):
+                self._analysis_config = self.load_yaml_config(settings.ANALYSIS_CONFIG_FILE)
+                self._update_last_modified(settings.ANALYSIS_CONFIG_FILE)
+            return self._analysis_config or {}
     
     def _should_reload(self, file_path: Path) -> bool:
         """检查是否需要重新加载配置"""

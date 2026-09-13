@@ -1,0 +1,107 @@
+%% 正文抓取链路（需求②，含降级分支）
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant EP as content.py (endpoint)
+    participant FS as FeishuService
+    participant CF as ContentFetcher
+    participant RC as RobotsTxtChecker
+    participant NET as 目标站点
+    participant EX as ContentExtractor
+
+    C->>EP: POST /collection/content/fetch {urls|record_ids, write_back, overwrite}
+    EP->>EP: 校验：urls 与 record_ids 均空 → 400
+    alt 传了 record_ids
+        EP->>FS: list_records(headlines, page_size=LIST_PAGE_SIZE)
+        FS-->>EP: items[{record_id, fields{id,url,content}}]
+        EP->>EP: 建索引 record_id/业务id → url，全部查不到 → 404
+    end
+    EP->>CF: fetch_many(items, concurrency, timeout)
+    loop 每条（Semaphore 限并发）
+        CF->>RC: can_fetch(url)
+        alt robots 禁止
+            RC-->>CF: False
+            CF-->>EP: FetchOutcome(status=skipped, ROBOTS_DISALLOWED)
+        else 允许
+            CF->>NET: GET url (UA=IntelligentAgentAPI/1.0, timeout)
+            alt 超时/连接错/HTTP 错
+                NET-->>CF: TimeoutError / 5xx
+                CF-->>EP: FetchOutcome(status=failed, FETCH_TIMEOUT/CONNECT/HTTP, retryable)
+            else 200
+                NET-->>CF: html
+                CF->>EX: extract(html, selector=site_code对应选择器)
+                alt 抽出为空
+                    EX-->>CF: ExtractResult(text='', extractor='none')
+                    CF-->>EP: FetchOutcome(status=failed, EXTRACT_EMPTY)
+                else 成功
+                    EX-->>CF: ExtractResult(text, 'site_selector'|'generic')
+                    CF-->>EP: FetchOutcome(status=success, content, elapsed_ms)
+                end
+            end
+        end
+    end
+    opt write_back=True
+        EP->>FS: batch_update_records(headlines, [{record_id, fields:{content}}])
+        Note over EP,FS: 覆盖策略：should_write_back(existing,new,overwrite)<br/>默认仅当 content 为空才写
+        FS-->>EP: {code:0, data:{updated:n}}
+    end
+    EP-->>C: 200 {code:200,data:{total,succeeded,failed,skipped,results[]}}
+    Note over C,EP: 单条失败不影响整批（仍 200）；仅服务端异常才 500
+
+%% =====================================================================
+%% ai_insights 生成并写入链路（需求③，含降级分支）
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant EP as insights.py (endpoint)
+    participant IS as InsightsService
+    participant FS as FeishuService
+    participant CM as ConfigManager
+    participant LP as LLMProcessor
+    participant LC as LLMClient(real|mock)
+
+    C->>EP: POST /analysis/insights/generate {record_ids, generate, llm, dry_run, write}
+    EP->>EP: record_ids 与 urls 均空 → 400
+    EP->>IS: generate(req)
+    IS->>FS: list_records(headlines)
+    FS-->>IS: items[]
+    IS->>IS: 反查选中记录；全不存在 → 404(HEADLINE_NOT_FOUND)
+    alt write=True
+        IS->>FS: get_table_fields_uncached(ai_insights)
+        FS-->>IS: online_fields
+        IS->>IS: missing = TABLE_PLANS['ai_insights'] - online
+        alt missing 非空（schema 未确认）
+            IS-->>EP: 逐条 status=failed, TABLE_SCHEMA_UNCONFIRMED（不写入）
+        end
+    end
+    IS->>CM: get_config()['feature_analysis']['llm'] + get_credentials()['llm']
+    CM-->>IS: provider/model/base_url/api_key
+    IS->>LP: 构造 LLMProcessor（provider 覆盖 + 工厂）
+    LP->>LC: build_llm_client(...)
+    alt 无 api_key
+        LC-->>LP: (LLMMockClient, 'mock')
+    else 有 api_key
+        LC-->>LP: (OpenAICompatClient, 'real')
+    end
+    loop 每条记录
+        IS->>LP: analyze_* / generate(prompt)
+        LP->>LC: generate(prompt, temperature, max_tokens)
+        alt LLM 超时 / 响应解析失败
+            LC-->>LP: raise / 非 JSON
+            LP-->>IS: 降级：_parse_analysis_result 兜底 / error
+            IS-->>EP: 该条 status=failed, LLM_TIMEOUT|LLM_RESPONSE_PARSE_ERROR
+        else 正常
+            LC-->>LP: text
+            LP-->>IS: 解析结果 dict
+            IS->>IS: build_insight_fields(headline, llm_out, generate_set, id)
+        end
+    end
+    opt write=True 且 schema 已确认 且 非 dry_run
+        IS->>FS: batch_add_records(ai_insights, [{"fields": 14字段}])
+        FS-->>IS: {code:0, data:{records:[...]}}
+        Note over IS,FS: 走唯一收口，内置 20k 超限自愈
+    end
+    IS-->>EP: {total,generated,written,failed,llm_client,results[]}
+    EP-->>C: 200
+
+    Note over C,EP: 另有 GET /analysis/insights/preflight：<br/>返回 llm{provider_configured,has_api_key,client} + table{schema_confirmed,missing_fields}

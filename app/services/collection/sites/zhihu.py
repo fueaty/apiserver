@@ -140,8 +140,7 @@ class ZhihuSite(BaseSite):
                                             "content": target.get('excerpt', ''),
                                             "published_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                                             "collected_at": self._get_current_time(),  # 使用统一的时间获取方法
-                                            "site_code": self.site_code,  # 添加site_code字段
-                                            "platform": "zhihu"
+                                            "site_code": self.site_code  # 添加site_code字段
                                         }
                                     })
                                     

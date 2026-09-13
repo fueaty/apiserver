@@ -10,7 +10,6 @@ from pydantic import BaseModel
 from app.services.publication.manager import PublicationManager
 from app.api.v1.endpoints.auth import verify_token
 from app.utils.logger import logger
-from app.services.feishu.feishu_service import FeishuService
 
 
 router = APIRouter()
@@ -54,25 +53,13 @@ async def publish_content(
         result = await publication_manager.publish(request_data)
         
         logger.info(f"发布任务完成，平台: {request.platform}, 状态: {'成功' if result.get('code') == 200 else '失败'}")
-        
-        # 如果发布成功，将结果存储到飞书表格
-        if result.get("code") == 200:
-            try:
-                feishu_service = FeishuService()
-                sheet_data = {
-                    "platform": request.platform,
-                    "client_id": payload.get("client_id"),
-                    "content_title": request.content.get("title", ""),
-                    "status": "success",
-                    "timestamp": result.get("data", {}).get("timestamp", ""),
-                    "publish_url": result.get("data", {}).get("url", "")
-                }
-                await feishu_service.append_to_sheet(sheet_data)
-                logger.info(f"已将发布结果写入飞书表格: 平台={request.platform}, 标题={request.content.get('title', '')}")
-            except Exception as e:
-                logger.error(f"写入飞书表格失败: {str(e)}", exc_info=True)
-                # 不中断主流程，继续返回发布结果
-        
+
+        # ⚠️ 这里**不要**再往飞书写一次。
+        # 历史上此处调用了 `feishu_service.append_to_sheet(sheet_data)`，
+        # 但 FeishuService 从未有过这个方法 → 每次发布成功都抛 AttributeError，
+        # 被下面的 except 吞掉、只留一条 "写入飞书表格失败" 的错误日志。
+        # 真正的发布结果入库在 PublicationManager._store_publish_result_to_feishu()
+        # （manager.py，写 publish_tasks 表），已经由上面的 publish() 内部完成。
         return result
         
     except Exception as e:

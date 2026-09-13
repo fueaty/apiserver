@@ -1,0 +1,50 @@
+# 分析特性配置（需求③：ai_insights 深度内容生成）
+#
+# 读取方式：ConfigManager.get_config() 读取本文件的**根内容**，
+# 调用方（app/services/analysis/ 下的 llm_processor / feishu_data_loader /
+# hotspot_classifier / analysis_storage）统一按
+#     config_manager.get_config()['feature_analysis'][<子段>]
+# 取用各自所需的子段。
+#
+# 本文件缺失时 get_config() 返回 {}，各调用方通过 .get(..., {}) 自然退化。
+#
+# ⚠️ 敏感信息（api_key）**绝不写在这里**，只写 config/credentials.yaml 的
+#    `llm` 段（示例见 config/credentials.yaml.example）。本文件只放非敏感默认值。
+
+feature_analysis:
+  # ---------------------------------------------------------------------------
+  # LLM（大模型）配置
+  # 默认**全部注释掉 provider/model_name**，使系统在无任何外部 Key 时
+  # 退化为 LLMMockClient（build_llm_client 检测不到 api_key 即返回 Mock），
+  # 保证链路与离线测试可跑通。真实 provider/model 请在 credentials.yaml 的
+  # `llm` 段填写；这里可选择性覆盖默认值。
+  # ---------------------------------------------------------------------------
+  llm:
+    # provider: openai                 # 大模型服务商（OpenAI 兼容协议）
+    # model_name: gpt-4-turbo          # 模型名
+    # base_url: https://api.openai.com/v1
+    # timeout: 30                      # 单次调用超时（秒）
+    temperature: 0.7                   # 生成温度默认值
+    max_tokens: 1000                   # 单次生成最大 token 默认值
+
+  # ---------------------------------------------------------------------------
+  # 飞书多维表格配置（分析结果写入用）
+  # 真实 app_token / table_id 从 config/credentials.yaml 读取，这里仅保留占位。
+  # ---------------------------------------------------------------------------
+  feishu:
+    app_token: "YOUR_APP_TOKEN_HERE"
+    table_id: "YOUR_TABLE_ID_HERE"
+
+  # ---------------------------------------------------------------------------
+  # 热点分类配置
+  # ---------------------------------------------------------------------------
+  classification:
+    enabled: true                      # 是否启用自动分类
+    default_category: "综合"           # 无法判定时的兜底分类
+
+  # ---------------------------------------------------------------------------
+  # 分析结果存储配置
+  # ---------------------------------------------------------------------------
+  storage:
+    enabled: true                      # 是否持久化分析结果
+    table: "ai_insights"               # 目标表逻辑名（映射见 field_rules.TABLE_PLANS）

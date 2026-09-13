@@ -114,51 +114,6 @@ publish_platforms:
         timeliness: 0.1
         engagement_potential: 0.1
 
-  zhihu:
-    name: "知乎专栏"
-    enabled: true
-    rate_limit: 10
-    timeout: 15
-    request:
-      method: "POST"
-      url: "https://api.zhihu.com/articles"
-      headers:
-        Content-Type: "application/json"
-      field_mapping:
-        title:
-          source: "title"
-        content:
-          source: "body"
-        image_urls:
-          source: "images"
-        topics:
-          source: "tags"
-        publish_time:
-          source: "schedule_time"
-    constraints:
-      max_title_length: 100
-      max_body_length: 50000
-    selection_rules:
-      target_audience: ["高知人群", "学生群体", "职场人士"]
-      content_preferences: ["科技专业分析", "技术讨论", "实用技巧", "资源盘点"]
-      content_style: "专业分析, 问答形式, 数据驱动"
-      optimal_length: "1000-3000字"
-      best_post_times: ["20:00-23:00", "09:00-11:00"]
-      domain_focus:
-        primary: "科技"
-        secondary: "生活"
-        content_types:
-          - "专业问答"
-          - "技术讨论"
-          - "实用技巧"
-          - "资源盘点"
-        avoid_domains: ["未经证实的政治传闻", "极端观点"]
-      scoring_weights:
-        content_match: 0.4
-        audience_relevance: 0.3
-        timeliness: 0.2
-        engagement_potential: 0.1
-  
   xiaohongshu:
     name: "小红书"
     enabled: true
