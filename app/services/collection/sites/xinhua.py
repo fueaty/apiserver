@@ -11,7 +11,7 @@ from ....utils.id_generator import generate_content_id
 # mock 行的显式标记（见 app/services/collection/mock_utils.py）。
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
 # 有测试锁：tests/test_mock_governance.py。
-from ..mock_utils import MOCK_FLAG
+from ..mock_utils import MOCK_FLAG, fallback_or_empty
 
 
 class XinhuaSite(BaseSite):
@@ -47,8 +47,9 @@ class XinhuaSite(BaseSite):
                     
         except Exception as e:
             print(f"新华网采集脚本出错: {e}")
-            # 发生错误时返回模拟数据
-            results = self._get_mock_data()
+            # 采集失败 → 唯一回退入口：生产默认**不伪造**（返回空 + 告警）。
+            # 传 callable（self._get_mock_data）惰性求值：默认路径根本不构造假数据。
+            results = fallback_or_empty(self.site_code, f"collect 异常: {e}", self._get_mock_data)
             
         return results
     
@@ -144,9 +145,11 @@ class XinhuaSite(BaseSite):
             print(f"解析新华网主页数据出错: {e}")
             pass
             
-        # 如果没有解析到数据，返回模拟数据
+        # 如果没有解析到数据，走唯一回退入口（生产默认返回空、不伪造）
         if not hot_data:
-            hot_data = self._get_mock_data()
+            hot_data = fallback_or_empty(
+                self.site_code, "解析结果为空（选择器未命中/页面结构变化）", self._get_mock_data
+            )
         else:
             # 再次去重，基于标题
             seen_titles = set()
@@ -172,9 +175,10 @@ class XinhuaSite(BaseSite):
             }
 
             # 关键：本段「按固定键重建 result」会把 _get_mock_data() 打的 mock 标记抹掉。
-            # 当解析路径回退到 mock（上方 `if not hot_data: hot_data = self._get_mock_data()`）
-            # 时，必须把标记**透传**回来，否则 mock 在这里被「洗白」成普通记录 → 静默混入写集
-            #（这是 xinhua 解析路径的潜在泄漏点，见 mock_utils.py 模块注释）。
+            # 当解析路径回退到 mock（上方 `hot_data = fallback_or_empty(..., self._get_mock_data)`，
+            # 仅 opt-in 时才返回带标记的 mock）时，必须把标记**透传**回来，否则 mock 在这里被
+            #「洗白」成普通记录 → 静默混入写集（这是 xinhua 解析路径的潜在泄漏点，
+            # 见 mock_utils.py 模块注释）。
             if item.get(MOCK_FLAG) is True:
                 result[MOCK_FLAG] = True
 

@@ -10,8 +10,9 @@ import sys
 
 from app.services.collection.engine import CollectionEngine
 # mock 治理：本端点是**第二条**直写 headlines 的路径（batch_add_records），
-# 绕过 script/collection_pipeline.py 的 split_real_and_mock —— 必须自行剔除 mock。
-from app.services.collection.mock_utils import is_mock_record
+# 绕过 script/collection_pipeline.py 的 split_write_set —— 改为与 pipeline 共用
+# write_set.build_headline_records（单一实现，按 is_mock 标记在同一处剔除 mock，可行为测试）。
+from app.services.collection.write_set import build_headline_records
 from app.services.selection.engine import SelectionEngine
 from app.services.feishu.feishu_service import FeishuService
 from app.api.v1.endpoints.auth import verify_token
@@ -64,102 +65,18 @@ async def collect_and_store(
         
         # 执行采集
         results = await collection_engine.collect(params)
-        
-        # 过滤空结果并优化数据格式
-        optimized_results = []
-        feishu_records = []
-        mock_skipped = 0
-        for result in results:
-            if result and result.get("news"):
-                # 优化数据格式，便于选材引擎直接使用
-                optimized_result = {
-                    "site_code": result["site_code"],
-                    "collect_time": result["collect_time"],
-                    "data_count": result["data_count"],
-                    "news": []
-                }
-                
-                # 转换新闻数据格式，增加字段处理
-                for news_item in result["news"]:
-                    # —— mock 治理（本路径无 pipeline 的 split_real_and_mock，须自行剔除）——
-                    # 本端点调用同一个 CollectionEngine，会走各站的 _get_mock_data() 回退；
-                    # 过滤必须发生在**按固定键重建 feishu_record 之前**——重建只保留白名单键，
-                    # 会把 is_mock 标记洗白（与 xinhua.py 解析路径同类陷阱），使 mock 静默入库。
-                    if is_mock_record(news_item):
-                        mock_skipped += 1
-                        continue
 
-                    # 提取fields中的字段
-                    fields = news_item.get("fields", {})
-                    
-                    # 生成标准化的热点ID
-                    from app.utils.id_generator import generate_content_id
-                    hotspot_id = generate_content_id()
-                    
-                    # 计算热度等级
-                    hot_text = fields.get("hot", 0)
-                    if isinstance(hot_text, str) and '万' in hot_text:
-                        # 处理包含"万"的热度值，如"5.7万"
-                        hot_value = int(float(hot_text.replace('万', '')) * 10000)
-                    else:
-                        hot_value = int(hot_text) if hot_text else 0
-                    hot_level = ""  # 由选材引擎计算
-                    
-                    # 提取关键词和分类
-                    title = fields.get("title", "")
-                    keywords = []  # 由选材引擎计算
-                    content_category = category if category else ""  # 由选材引擎计算
-                    
-                    # 按照飞书格式返回，包含fields字段
-                    optimized_news = {
-                        "fields": {
-                            "hotspot_id": hotspot_id,
-                            "title": title,
-                            "source": result["site_code"],
-                            "platform": fields.get("platform", result["site_code"]),
-                            "hot_value": int(float(fields.get("hot").replace('万', '')) * 10000) if isinstance(fields.get("hot"), str) and '万' in fields.get("hot") else int(fields.get("hot")) if isinstance(fields.get("hot"), (int, float)) else int(float(fields.get("hot"))) if isinstance(fields.get("hot"), str) and fields.get("hot").replace('万', '').isdigit() else 0,
-                            "hot_level": "",  # 由选材引擎计算
-                            "rank": int(fields.get("rank", 0)) if fields.get("rank") else 0,
-                            "url": fields.get("url", ""),
-                            "publish_time": fields.get("date", ""),
-                            "category": "",  # 由选材引擎计算
-                            "keywords": keywords,
-                            "collect_time": result["collect_time"],
-                            "summary": fields.get("content", ""),  # 使用原始内容作为摘要
-                            "content_quality": {}  # 由选材引擎计算
-                        }
-                    }
+        # 过滤空结果并优化数据格式。
+        # 写集构造收敛到 write_set.build_headline_records（单一实现、可行为测试）：
+        # 它在**按固定键重建 feishu_record 之前**按 is_mock 标记过滤 mock——
+        # 重建只保留白名单键，会把 is_mock 标记洗白（与 xinhua.py 解析路径同类陷阱），
+        # 使 mock 静默入库。故过滤时序在这一处集中保证。
+        optimized_results, feishu_records, mock_skipped = build_headline_records(results, category)
 
-                    # print(f"正在处理新闻：\n{optimized_news}")
-                    optimized_result["news"].append(optimized_news)
-                    
-                    # 构造飞书记录
-                    feishu_record = {
-                        "fields": {
-                            "id": hotspot_id,
-                            "title": title,
-                            "url": fields.get("url", ""),
-                            "content": fields.get("content", ""),
-                            "author": "",  # 采集数据中暂无作者信息
-                            "category": content_category,
-                            "hot": str(int(float(fields.get("hot").replace('万', '')) * 10000) if isinstance(fields.get("hot"), str) and '万' in fields.get("hot") else int(fields.get("hot")) if isinstance(fields.get("hot"), (int, float)) else int(float(fields.get("hot"))) if isinstance(fields.get("hot"), str) and fields.get("hot").replace('万', '').isdigit() else 0),
-                            "rank": str(int(fields.get("rank", 0)) if fields.get("rank") else 0),
-                            "collected_at": result["collect_time"],
-                            # 需求①(R1-2)：published_at 已加入 TABLE_PLANS['headlines']，
-                            # 写入侧必须同步补键，否则该 dict 字段集 ≠ 表规划，字段会被丢弃。
-                            "published_at": fields.get("published_at", ""),
-                            "site_code": result["site_code"],
-                            "status": "collected"
-                        }
-                    }
-                    feishu_records.append(feishu_record)
-                
-                optimized_results.append(optimized_result)
-        
         if mock_skipped:
             logger.warning(
                 "采集并存储：已从写集与选材中排除 %d 条 mock 演示数据（未入库）。"
-                "本路径无 pipeline 的 split_real_and_mock，故在重建记录前按 is_mock 标记过滤。",
+                "本路径无 pipeline 的 split_write_set，故在重建记录前按 is_mock 标记过滤。",
                 mock_skipped,
             )
 

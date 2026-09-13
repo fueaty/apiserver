@@ -11,7 +11,7 @@ from ....utils.id_generator import generate_content_id
 # mock 行的显式标记（见 app/services/collection/mock_utils.py）。
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
 # 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
-from ..mock_utils import MOCK_FLAG
+from ..mock_utils import MOCK_FLAG, fallback_or_empty
 
 
 class CctvSite(BaseSite):
@@ -47,8 +47,8 @@ class CctvSite(BaseSite):
                     
         except Exception as e:
             print(f"央视新闻采集脚本出错: {e}")
-            # 发生错误时返回模拟数据
-            results = self._get_mock_data()
+            # 采集失败 → 唯一回退入口（生产默认返回空、不伪造）
+            results = fallback_or_empty(self.site_code, f"collect 异常: {e}", self._get_mock_data)
             
         # 根据参数决定返回格式
         format_type = params.get("format", "raw")
@@ -117,9 +117,11 @@ class CctvSite(BaseSite):
             print(f"解析央视新闻主页数据出错: {e}")
             pass
             
-        # 如果没有解析到数据，返回模拟数据
+        # 如果没有解析到数据，走唯一回退入口（生产默认返回空、不伪造）
         if not hot_data:
-            hot_data = self._get_mock_data()
+            hot_data = fallback_or_empty(
+                self.site_code, "解析结果为空（选择器未命中/页面结构变化）", self._get_mock_data
+            )
         else:
             # 去重，基于标题
             seen_titles = set()

@@ -13,7 +13,7 @@ from ....utils.id_generator import generate_content_id
 # mock 行的显式标记（见 app/services/collection/mock_utils.py）。
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
 # 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
-from ..mock_utils import MOCK_FLAG
+from ..mock_utils import MOCK_FLAG, fallback_or_empty
 
 
 class BaiduSite(BaseSite):
@@ -46,12 +46,13 @@ class BaiduSite(BaseSite):
                     # 解析数据
                     results = self._parse_baidu_data(text)
                 else:
-                    # 请求失败时返回模拟数据
-                    results = self._get_mock_data()
+                    # 请求失败 → 唯一回退入口（生产默认返回空、不伪造）
+                    results = fallback_or_empty(
+                        self.site_code, f"HTTP 状态码 {response.status}", self._get_mock_data)
                     
         except Exception as e:
-            # 发生错误时返回模拟数据
-            results = self._get_mock_data()
+            # 采集失败 → 唯一回退入口（生产默认返回空、不伪造）
+            results = fallback_or_empty(self.site_code, f"collect 异常: {e}", self._get_mock_data)
             
         return results
     

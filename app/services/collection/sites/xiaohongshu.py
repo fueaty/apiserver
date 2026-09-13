@@ -16,7 +16,7 @@ from ....utils.id_generator import generate_content_id
 # mock 行的显式标记 + 显式判定（见 app/services/collection/mock_utils.py）。
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠标题关键词启发式（见 _is_mock_data）。
 # 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
-from ..mock_utils import MOCK_FLAG, is_mock_record
+from ..mock_utils import MOCK_FLAG, is_mock_record, fallback_or_empty
 
 
 class XiaohongshuSite(BaseSite):
@@ -59,9 +59,10 @@ class XiaohongshuSite(BaseSite):
             else:
                 print("网页采集结果为空")
             
-            # 如果网页解析方式失败，返回模拟数据
-            print("返回模拟数据")
-            mock_data = self._get_mock_data()
+            # 如果网页解析方式失败，走唯一回退入口（生产默认返回空、不伪造）
+            print("采集为空，走统一回退入口（默认不伪造）")
+            mock_data = fallback_or_empty(
+                self.site_code, "网页采集为空或被判为 mock", self._get_mock_data)
             formatted_results = []
             for item in mock_data:
                 formatted_results.append({
@@ -71,8 +72,8 @@ class XiaohongshuSite(BaseSite):
                     
         except Exception as e:
             print(f"小红书采集脚本出错: {e}")
-            # 发生错误时返回模拟数据
-            mock_data = self._get_mock_data()
+            # 采集失败 → 唯一回退入口（生产默认返回空、不伪造）
+            mock_data = fallback_or_empty(self.site_code, f"collect 异常: {e}", self._get_mock_data)
             formatted_results = []
             for item in mock_data:
                 formatted_results.append({

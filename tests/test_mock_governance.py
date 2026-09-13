@@ -21,7 +21,8 @@ P1 只给 3 站打了标记，而 baidu/cctv/weibo/xiaohongshu 的 mock **本就
   [C] xinhua 解析路径回退 mock：即便被包成 {"fields": item} 也不得入写集。
   [D] I3：真实数据不受影响。
   [E] 变异对照（M1 包装 / M2 抹标记 / M3 仅顶层）。
-  [F] 接线锁（pipeline / enhanced_collection）。
+  [F] 接线锁（文本层）：pipeline / enhanced_collection 均接入共享写集实现 write_set。
+      行为层强锁见 tests/test_write_path_wiring.py（桩驱动跑真实写路径）。
   [G] N2：xiaohongshu._is_mock_data 改为基于标记；真实路径不被替换。
   [H] N1：enhanced_collection 第二条写入路径在重建记录前过滤 mock。
 
@@ -95,6 +96,7 @@ sys.path.append(ROOT)
 
 from app.services.collection.mock_utils import (  # noqa: E402
     MOCK_FLAG,
+    ALLOW_MOCK_ENV,
     is_mock_record,
     split_real_and_mock,
 )
@@ -200,13 +202,31 @@ def test_dynamic_enumeration():
 
 
 def test_xinhua_parse_path_leak_closed():
-    """[C] xinhua 解析路径回退 mock：即便被包成 {'fields': item} 也不得入写集。"""
+    """[C] xinhua 解析路径回退 mock：即便被包成 {'fields': item} 也不得入写集。
+
+    #44 起回退改显式 opt-in：**默认**解析为空直接返回 []（不伪造）。
+    这里在 opt-in 下取 mock，再验证"被包装后仍被识别/排除"这条**标记透传**保证；
+    并额外断言默认模式下不再产出 mock。
+    """
     print("\n[C] xinhua 解析路径回退 mock：即便被包装也不得入写集")
 
     site = _load_site_class("xinhua")("xinhua", {"timeout": 10})
-    parsed = site._parse_xinhua_homepage_data("<html></html>")
 
-    check("[C] 解析路径回退时确实产出了记录（走了 mock 回退）",
+    # 默认（opt-in 关闭）：解析为空 → 不再伪造
+    os.environ.pop(ALLOW_MOCK_ENV, None)
+    parsed_default = site._parse_xinhua_homepage_data("<html></html>")
+    check("[C] 默认（不伪造）：解析为空时返回空 list",
+          isinstance(parsed_default, list) and len(parsed_default) == 0,
+          f"len={len(parsed_default) if isinstance(parsed_default, list) else 'N/A'}")
+
+    # opt-in 打开：取 mock，验证标记透传保证
+    os.environ[ALLOW_MOCK_ENV] = "1"
+    try:
+        parsed = site._parse_xinhua_homepage_data("<html></html>")
+    finally:
+        os.environ.pop(ALLOW_MOCK_ENV, None)
+
+    check("[C] opt-in：解析路径回退时确实产出了记录（走了 mock 回退）",
           isinstance(parsed, list) and len(parsed) > 0,
           f"len={len(parsed) if isinstance(parsed, list) else 'N/A'}")
     check("[C] 输出是 {'fields': item} 包裹形态（泄漏的危险形状）",
@@ -265,26 +285,39 @@ def test_mutation_controls():
 
 
 def test_pipeline_and_endpoint_wiring():
-    """[F] 接线锁：pipeline 与 enhanced_collection 都必须真的过滤 mock。"""
-    print("\n[F] 接线锁：写路径确实调用过滤")
+    """[F] 接线锁（文本层）：pipeline 与 enhanced_collection 都接入**共享写集实现**。
+
+    行为层的强保证在 tests/test_write_path_wiring.py（桩驱动跑真实 pipeline / 真端点，
+    断言真正传给 batch_add_records 的记录里 mock==0）——那里能抓 `continue→pass` 与
+    「忽略返回值」。此处只保留"**接线存在**"这一层（谁被接进写路径）。
+    """
+    print("\n[F] 接线锁：写路径接入共享写集实现 write_set")
 
     with open(os.path.join(ROOT, "script", "collection_pipeline.py"), encoding="utf-8") as f:
         pipe = f.read()
-    check("[F] collection_pipeline.py 导入并调用 split_real_and_mock",
-          "split_real_and_mock" in pipe and "split_real_and_mock(" in pipe,
-          "写入层未接入 mock 拆分")
+    check("[F] collection_pipeline.py 导入并调用 split_write_set",
+          "from app.services.collection.write_set import split_write_set" in pipe
+          and "split_write_set(" in pipe,
+          "写入层未接入共享写集实现")
     check("[F] collection_pipeline.py 使用站点级检测器 get_available_sites()",
           "get_available_sites()" in pipe, "缺少站点级检测器")
 
     with open(os.path.join(ROOT, "app", "api", "v1", "endpoints", "enhanced_collection.py"),
               encoding="utf-8") as f:
         ec = f.read()
-    check("[N1:F] enhanced_collection 导入并调用 is_mock_record 过滤",
-          "from app.services.collection.mock_utils import is_mock_record" in ec
-          and "is_mock_record(news_item)" in ec,
-          "第二条写入路径未过滤 mock")
-    check("[N1:F] 过滤发生在重建 feishu_record 之前（避免标记被洗白）",
-          ec.index("is_mock_record(news_item)") < ec.index("feishu_record = {"),
+    check("[N1:F] enhanced_collection 导入并调用 build_headline_records",
+          "from app.services.collection.write_set import build_headline_records" in ec
+          and "build_headline_records(" in ec,
+          "第二条写入路径未接入共享写集实现")
+    check("[N1:F] enhanced_collection 不再自行内联过滤（治理收敛到 write_set 单一实现）",
+          "is_mock_record(news_item)" not in ec,
+          "仍在端点内联过滤 → 与共享实现漂移风险")
+
+    with open(os.path.join(ROOT, "app", "services", "collection", "write_set.py"),
+              encoding="utf-8") as f:
+        ws = f.read()
+    check("[N1:F] write_set.build_headline_records 的过滤**早于**重建 feishu_record",
+          ws.index("if is_mock_record(news_item):") < ws.index("feishu_record = {"),
           "过滤点在重建之后 → 标记会被洗白")
 
 
@@ -326,13 +359,23 @@ def test_n2_xiaohongshu_marker_based():
           and all(not is_mock_record(r) for r in out),
           f"out[0]={out[0] if out else 'N/A'}")
 
-    # mock 路径：网页为空 → 返回带标记的 mock
+    # mock 路径：网页为空 → 默认返回 []（不伪造）；opt-in 才返回带标记的 mock
     async def _fake_empty():
         return []
 
     xhs._collect_via_web = _fake_empty
-    out2 = asyncio.run(xhs.collect({}))
-    check("[G] N2 mock 路径：collect() 返回带标记的 mock（可被写入层剔除）",
+    os.environ.pop(ALLOW_MOCK_ENV, None)
+    out_default = asyncio.run(xhs.collect({}))
+    check("[G] N2 mock 路径（默认）：collect() 返回空、不伪造",
+          isinstance(out_default, list) and len(out_default) == 0,
+          f"out_default={out_default}")
+
+    os.environ[ALLOW_MOCK_ENV] = "1"
+    try:
+        out2 = asyncio.run(xhs.collect({}))
+    finally:
+        os.environ.pop(ALLOW_MOCK_ENV, None)
+    check("[G] N2 mock 路径（opt-in）：collect() 返回带标记的 mock（可被写入层剔除）",
           len(out2) > 0 and all(is_mock_record(r) for r in out2),
           f"out2={out2}")
 

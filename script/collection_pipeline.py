@@ -28,8 +28,10 @@ from app.services.feishu.limits import (
 )
 from app.core.config import config_manager                     # 配置管理器
 import app.wework.notification_push as notification_push
-# mock 治理：把 mock 回退行按**显式意图标记**排除出写集（而不是靠「忘了包 fields」这个 bug）。
-from app.services.collection.mock_utils import split_real_and_mock, MOCK_FLAG
+# mock 治理：写集构造收敛到单一实现 write_set.split_write_set（可行为测试），
+# mock 回退行按**显式意图标记**排除出写集（而不是靠「忘了包 fields」这个 bug）。
+from app.services.collection.mock_utils import MOCK_FLAG
+from app.services.collection.write_set import split_write_set
 
 
 def _site_code_of(record):
@@ -134,21 +136,17 @@ async def test_collection_pipeline():
             print(msg)
             return False
             
-        # 整理采集到的数据，准备存入飞书表格
-        feishu_records_raw = []
-        for result in collection_results:
-            # 确保每条结果都有新闻数据
-            if result and result.get("news"):
-                # 将新闻数据添加到总记录列表中
-                feishu_records_raw.extend(result["news"])
-
-        # —— (b) mock 治理 I1/I2：先把 mock 回退行按**显式意图标记**剔除，再进入写集 ——
+        # 整理采集到的数据，准备存入飞书表格。
+        # 写集构造收敛到 write_set.split_write_set（单一实现、可行为测试）：
+        # 它在**同一步**里完成「拼成扁平列表 + 按 is_mock 标记拆分」，mock 绝不进第一个返回值。
+        #
+        # —— mock 治理 I1/I2：先把 mock 回退行按**显式意图标记**剔除，再进入写集 ——
         # I1：mock 行不得入库，且由 is_mock 标记保证（**不**依赖「mock 恰好是扁平行 →
         #     被对齐层静默丢弃」这个 bug 兜底——一旦有人给 mock 也包上 {'fields': item}
         #     来"修形状不一致"，旧写法就会让 mock 静默入库污染生产表）。
         # I2：mock 回退必须可观测，且与「形状差额」**分开**报（否则差额告警被 mock 刷屏）。
-        # I3：真实数据不受影响——split_real_and_mock 只按标记拆，真实行原样保留。
-        feishu_records, mock_records = split_real_and_mock(feishu_records_raw)
+        # I3：真实数据不受影响——split 只按标记拆，真实行原样保留。
+        feishu_records, mock_records = split_write_set(collection_results)
         if mock_records:
             mock_sites = sorted({_site_code_of(r) for r in mock_records})
             mock_msg = (
