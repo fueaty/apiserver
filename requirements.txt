@@ -1,21 +1,29 @@
-# apiserver 运行时依赖锁定（由生产 `pip freeze` 重生成）
-# ------------------------------------------------------------------------------
-# 来源：生产机 `home-service` / openEuler 24.03 / Python 3.11.6
-#       （ssh -p 65023 root@192.168.3.105，部署在 /opt/apiserver）
-# 方法：以该机 `pip freeze`（108 条）为基线，剔除 **系统/RPM 提供的非项目依赖**
-#       与被 openEuler 打成本地 `file://` 轮子的包（这两类由 dnf 安装、无法从 PyPI
-#       复现，且与本项目无关），其余逐条 pin 到生产实际运行版本。
-#       全量原始快照（含被剔除项）留档：.workbuddy/_deploy/prod_pip_freeze.txt。
+# apiserver 运行时依赖锁定（生产 pip freeze 快照的「去噪超集」）
+# ==============================================================================
+# 性质（请勿误读）：本文件是【生产 freeze(108) − 17 个 OS/RPM 与 file:// 包 = 91】
+#   的**超集**，**不是**经裁剪的项目依赖闭包。多余条目只会多装东西；漏包才是致命，
+#   因此采用「超集 + 静态 import 扫描复核」而非「闭包裁剪」。
 #
-# 被剔除的系统包（17 个，均非 apiserver 依赖）：
+# 来源：生产机 home-service / openEuler 24.03 / Python 3.11.6
+#       （ssh -p 65023 root@192.168.3.105，部署在 /opt/apiserver）
+# 全量原始快照（108 条、含被剔除项）：doc/生产pip-freeze-openEuler24.03-py311-20260913.txt
+#
+# 静态 import 扫描复核（app/**/*.py + script/**/*.py，AST 口径）：
+#   共出现 20 个第三方顶层模块，**全部**在本文件有对应 pin（0 个漏配）；
+#   lark_oapi→lark-oapi、bs4→beautifulsoup4、jose→python-jose、yaml→PyYAML、
+#   pydantic_settings→pydantic-settings 等「导入名≠包名」均已逐条对上。
+#   口径局限：不含动态字符串导入（importlib）与 dnf 提供的 OS 包。
+#
+# 被剔除的 17 个系统包（dnf 安装、无法从 PyPI 复现，均非本项目依赖）：
 #   argcomplete, asciidoc, configobj, cockpit, dbus-python, distro, gpg,
 #   libcomps, libvirt-python, nftables, perf, PyGObject, python-linux-procfs,
 #   pyudev, rpm, schedutils, six
+#   注：six 是 python-dateutil 的 install_requires，pip 会随其自动装入 → 不构成漏包。
 #
 # ⚠️ 历史：旧版本 pin 的是 fastapi==0.104.1 / pydantic==2.0.0 / cryptography==41.0.0
 #    等**从未在生产运行过**的版本，且缺 lark-oapi / httpx / playwright 等实际依赖
 #    —— 按旧文件纯净安装的环境**无法启动**。本文件才是生产的真实基线。
-# ------------------------------------------------------------------------------
+# ==============================================================================
 
 aiofiles==25.1.0
 aiohappyeyeballs==2.7.1
@@ -63,6 +71,9 @@ narwhals==2.26.0
 numpy==2.4.6
 packaging==26.3
 pandas==3.0.5
+# ⚠️ playwright：`pip install playwright` 只装 Python 包，**不含浏览器二进制**；
+#    采集 weibo 等 JS 页面还须执行 `playwright install chromium`，否则运行时抛
+#    "Executable doesn't exist"（生产 weibo 日志即此成因）。勿为「文件好看」删掉此行。
 playwright==1.62.0
 prometheus_client==0.26.0
 prompt_toolkit==3.0.53
