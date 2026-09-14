@@ -73,7 +73,7 @@ script/scheduled_cleanup.sh ──► script/cleanup_feishu_data.py
 | `app/wework/` | 企业微信通知与文件推送 |
 | `script/` | 生产入口与运维脚本（§二） |
 | `tests/` | **独立测试脚本**，直接 `python tests/<name>.py` 运行 |
-| `config/` | `sites.yaml` / `platforms.yaml` / `analysis.yaml` / `zhihu.yaml` / `xiaohongshu.yaml` / `credentials.yaml` / `redis.conf` |
+| `config/` | 仓库只跟踪 4 个：`sites.yaml` / `platforms.yaml` / `analysis.yaml` / `redis.conf`。另 3 个（`zhihu.yaml` / `xiaohongshu.yaml` / `credentials.yaml`）已 gitignore，仓库里只有对应的 `*.example` |
 | `doc/` | 设计文档与运维文档（§十） |
 | `secret/` | JWT 令牌生成脚本与本地令牌文件（不入 git） |
 
@@ -93,7 +93,7 @@ script/scheduled_cleanup.sh ──► script/cleanup_feishu_data.py
 | 澎湃新闻 | `thepaper` | 100 | `thepaper.py` 的 `MAX_RESULTS` |
 | 微博热搜 | `weibo` | 50 | JS 页面，需 playwright + `playwright install chromium` |
 | 百度热搜 | `baidu` | 50 | |
-| 知乎热榜 | `zhihu` | 50 | 可由 `config/zhihu.yaml` 的 `result_limit` 覆盖 |
+| 知乎热榜 | `zhihu` | 50 | 可由 `collection.result_limit`（**嵌套键**）覆盖；配置读的是**硬编码绝对路径** `/root/apiserver/config/zhihu.yaml`（`zhihu.py:43`），不是相对路径 |
 | 36氪 | `tech_36kr` | 50 | RSS |
 | 小红书 | `xiaohongshu` | 30 | |
 
@@ -151,7 +151,13 @@ script/scheduled_cleanup.sh ──► script/cleanup_feishu_data.py
 服务级：`GET /`、`GET /health`、`GET /metrics`、`/docs`（Swagger）。
 
 > ⚠️ `/api/v1/selection/selection/...` 的**重复段**是历史遗留（路由前缀 `/selection` + 端点 `/selection`），
-> 已有调用方在用，改动需评估兼容性。同理「增强采集」的前缀是 `/enhanced`，不是 `/enhanced-collection`。
+> 已有调用方在用，改动需评估兼容性。同理「增强采集」的前缀是 `/enhanced`，不是 `/enhanced-collection`
+> （后者只存在于**未被挂载的死代码** `app/api/v1/__init__.py:15`）。
+>
+> 上表按无尾斜杠书写。其中 `GET /api/v1/collection`（`collection.py:26`）与 `POST /api/v1/publication`
+> （`publication.py:26`）的装饰器是 `@router.get("/")` / `@router.post("/")`，**注册路径含尾斜杠**；
+> Starlette 默认 `redirect_slashes` 会 307 过去。此行为为**静态推导**，本机两个解释器都未装 fastapi，
+> 未能实例化 app 枚举 `app.routes` 实测。
 
 ---
 
@@ -170,11 +176,17 @@ script/scheduled_cleanup.sh ──► script/cleanup_feishu_data.py
 
 ## 七、测试
 
-约定：`tests/` 下每个文件都是**独立可执行脚本**，不依赖 pytest，直接：
+约定：`tests/` 下每个文件都是**独立可执行脚本**，**22 个跟踪文件里 0 个 `import pytest`**，直接：
 
 ```bash
-python tests/<name>.py        # 退出码 0 = 全通过；末行打印「结果: N 通过 / M 失败」
+python tests/<name>.py        # 退出码 0 = 全通过
 ```
+
+末行打印「结果: N 通过 / M 失败」的只有 **12 / 22** 个。没有该行的 10 个：`test_cctv_collection` /
+`test_content_endpoint` / `test_content_extractor` / `test_content_fetcher` / `test_feature_analysis_package` /
+`test_feishu_field_plans` / `test_insights_endpoint` / `test_insights_mapping` / `test_llm_client_factory` /
+`test_publication_platforms`（其中最后两个文件没有 `__main__` 守卫，靠模块级顺序执行 + 末尾 `sys.exit`）。
+**判据一律以退出码为准，不要靠 grep 结果行。**
 
 关键的几套（它们不是「跑一遍看看」，而是**防回归的锁**）：
 
@@ -200,9 +212,13 @@ python tests/<name>.py        # 退出码 0 = 全通过；末行打印「结果:
 - ⚠️ **不要在生产执行 `git pull`**：生产的 git 历史与本地不同，且工作区有未提交改动。
 - 采用 **scp 直传 + md5 比对**：记录基线 → 备份 → 覆盖 → 双端校验 → 冒烟（`py_compile` + import）。
 - **文件清单必须现算**（`git diff --name-status <base> <head>`），不要沿用任何手写清单——
-  仓库里有三份互相冲突的旧清单，沿用会**静默少发文件**。
+  发布工作区 `.workbuddy/_deploy/` 里有三份互相冲突的旧清单（分别写死 **10 / 43 / 4** 个文件），
+  沿用任一份都会**静默少发文件**（旧流程实际丢过 2 个新增文件）。该目录已被 gitignore，不在仓库跟踪范围内。
 - 生产**无 systemd 服务**：改代码不需要重启任何进程，下一次 cron 即生效。
-- 容器化路径（`deploy.sh` + `docker-compose.yml`：api + redis + celery-worker）与生产当前形态**不同**，不要混用。
+- 容器化路径与生产当前形态**不同**，不要混用。`docker-compose.yml` 的 4 个服务是
+  `apiserver` / `redis` / `mongodb` / `playwright`；而 `deploy.sh:59` / `:77` 却在检查 `api` 与
+  `celery-worker` —— 这两个服务名**在 compose 里并不存在**，即该脚本的健康检查永远不可能通过
+  （真 bug，未修）。
 
 运维与排障细节见 `doc/DEPLOY.md`、`doc/DEPLOYMENT.md`、`doc/服务器优化指南.md`。
 
@@ -210,14 +226,20 @@ python tests/<name>.py        # 退出码 0 = 全通过；末行打印「结果:
 
 ## 九、已知问题与待办（诚实清单）
 
-1. **站点失败会回退到 mock 数据**：产出行带显式标记，写入路径负责剔除；但三个写入面的处理**不一致**
-   （`collection_pipeline.py` 有写前容量预检 + mock 过滤，`enhanced_collection.py` 无预检，`POST /api/v1/feishu/sync` 两者都缺）。
-   唯一兜底是批写接口内部的 `1254103` 自愈重试。
+1. **站点失败会回退到 mock 数据**：产出行带显式标记，**三个写入面都会剔除**
+   （`script/collection_pipeline.py:149` `split_write_set`；
+   `app/api/v1/endpoints/enhanced_collection.py:74` `build_headline_records`；
+   `app/api/v1/endpoints/feishu.py:27` `split_real_and_mock`）。
+   **真正的缺口是「写前容量预检」只有一处有**：`collection_pipeline.py:298` `ensure_capacity`，
+   另两个写入面（`enhanced_collection.py:103` / `:272`、`POST /api/v1/feishu/sync`）都没有。
+   唯一兜底是批写接口内部的 `1254103` 自愈重试（`feishu_service.py:532-546`）。
 2. **归档的「搬进 `history_data/`」这一步不在任何调度里**，需要人工执行 `script/manage_history_data.py`。
    导出落点本身已修正为「项目根目录、不依赖 cwd」。
 3. **保留窗口不是保证**：见 §4.3 第 3 条；`DAILY_BUDGET` 目前没有任何代码路径强制。
 4. **重复实现**：`generate_content_id` 在 `app/utils/id_generator.py:13` 与 `secret/generate_auth_key.py:60` 各有一份。
-5. **站点产出为 0 时无法区分「今日无新内容」与「站点静默失败」**（日志层面）。
+5. **站点产出为 0 时无法区分「今日无新内容」与「站点静默失败」**。已有**站点级缺口告警**
+   （`collection_pipeline.py:113-120`：对「已启用但本次 0 产出」的站点推送企业微信并打印），
+   但告警文案**自认不判因**（`:117`「可能是该站未启用/配置缺失/采集为空」），日志层面仍无区分手段。
 
 ---
 
@@ -239,5 +261,11 @@ python tests/<name>.py        # 退出码 0 = 全通过；末行打印「结果:
 
 ---
 
-**修订记录**：本 README 于 2026-09-14 按仓库实况重建（原 2025-11-05 设计稿见 `git show f1a5f31:README.md`）。
+**修订记录**
+- 2026-09-14：按仓库实况重建（原 2025-11-05 设计稿见 `git show f1a5f31:README.md`）。
+- 2026-09-14：按 21 项逐条事实核对（`file:line` 级）修正 6 处 —— `/api/v1/feishu/sync` 的 mock 过滤
+  （实为**已有**，缺的只是预检）、`docker-compose.yml` 真实服务名与 `deploy.sh` 的不一致、
+  zhihu 配置的**硬编码路径 + 嵌套键**、测试「结果行」的适用范围（12/22）、三份旧清单所在目录
+  （`.workbuddy/_deploy/`，gitignored）、站点级缺口告警的存在。
+
 如发现本文与代码不符，**以代码为准**，并提交修正。
