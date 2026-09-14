@@ -7,6 +7,7 @@
 import sys
 import os
 import json
+from pathlib import Path
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
 
@@ -18,17 +19,40 @@ from app.core.config import config_manager
 import app.wework.file_push as file_push
 import app.wework.notification_push as notification_push
 
+# 项目根目录：<root>/script/export_today_headlines.py 的上两级 = <root>。
+# 归档落点一律锚到这里、不依赖 cwd（此前用 f"../{today}_..." 依赖 cwd：
+# 生产入口 run_daily_task.sh 先 cd 到 /opt/apiserver，此时 ".." = /opt，
+# 快照会落到 /opt 而不是 <root>，导致归档链（<root> → <root>/history_data）
+# 静默断开）。用 __file__ 推导后，无论从哪个 cwd 调用，都写 <root>/{date}_headlines_data.json。
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
 today = datetime.now().strftime("%Y-%m-%d")
+
+
+def resolve_output_path(output_file: str = None) -> str:
+    """把导出文件路径锚到项目根目录，使其不依赖运行时 cwd。
+
+    Args:
+        output_file: 用户指定的输出文件路径。None 表示使用默认命名规则。
+
+    Returns:
+        绝对路径字符串：
+        - output_file 为 None → ``<root>/{today}_headlines_data.json``
+        - output_file 为绝对路径 → 原样返回
+        - output_file 为相对路径 → ``<root>/<output_file>``
+    """
+    if output_file is None:
+        return str(PROJECT_ROOT / f"{today}_headlines_data.json")
+    if os.path.isabs(output_file):
+        return output_file
+    return str(PROJECT_ROOT / output_file)
+
 
 async def export_today_headlines_to_json(output_file: str = None):
     """导出飞书多维表格中今天采集的数据到JSON文件"""
     try:
-        # 如果没有指定输出文件，则使用默认命名规则保存到上级目录
-        if output_file is None:
-            output_file = f"../{today}_headlines_data.json"
-        elif not os.path.isabs(output_file) and not output_file.startswith("../"):
-            # 如果是相对路径且不是以../开头，则加上../前缀
-            output_file = f"../{output_file}"
+        # 输出路径统一锚到项目根目录（不依赖 cwd）
+        output_file = resolve_output_path(output_file)
         
         # 初始化飞书服务
         feishu_service = FeishuService()
@@ -111,15 +135,9 @@ def main():
     """主函数"""
     import asyncio
     
-    # 默认输出文件名（保存到上级目录）
-    output_file = f"../{today}_headlines_data.json"
-    
+    # 默认输出文件名：保存到项目根目录（相对/绝对路径均锚到项目根，不依赖 cwd）
     # 如果提供了命令行参数，则使用参数指定的文件名
-    if len(sys.argv) > 1:
-        output_file = sys.argv[1]
-        # 处理相对路径，确保输出到上级目录
-        if not os.path.isabs(output_file) and not output_file.startswith("../"):
-            output_file = f"../{output_file}"
+    output_file = resolve_output_path(sys.argv[1] if len(sys.argv) > 1 else None)
     
     print("🚀 开始导出今天采集的数据...")
     print(f"   输出文件: {output_file}")
