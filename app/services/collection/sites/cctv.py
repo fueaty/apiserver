@@ -12,6 +12,12 @@ from ....utils.id_generator import generate_content_id
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
 # 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
 from ..mock_utils import MOCK_FLAG, fallback_or_empty
+# 站点单轮产出上界（唯一事实来源：app/services/collection/site_caps.py）
+from ..site_caps import SITE_ROUND_CAPS
+
+# cctv 的【终】上界：仅用于下方「去重后的 `unique_data[:50]`」。
+# ⚠️ `news_items[:50]`（解析遍历）是【预】上限，**不在**容量模型内，保持原样。
+_MAX = SITE_ROUND_CAPS["cctv"]
 
 
 class CctvSite(BaseSite):
@@ -130,7 +136,7 @@ class CctvSite(BaseSite):
                 if item['title'] not in seen_titles:
                     seen_titles.add(item['title'])
                     unique_data.append(item)
-            hot_data = unique_data[:50]  # 限制最多50条
+            hot_data = unique_data[:_MAX]  # 限制最多 _MAX 条（容量上界，见 site_caps）
             
         return hot_data
     

@@ -26,6 +26,8 @@ from datetime import datetime
 from .base import BaseSite
 # 导入统一的ID生成函数
 from ....utils.id_generator import generate_content_id
+# 站点单轮产出上界（唯一事实来源：app/services/collection/site_caps.py）
+from ..site_caps import SITE_ROUND_CAPS
 
 
 class ZhihuSite(BaseSite):
@@ -148,8 +150,8 @@ class ZhihuSite(BaseSite):
                                 print(f"解析知乎热榜单项数据时出错: {e}")
                                 continue
                         
-                        # 限制返回数量
-                        results = results[:self.zhihu_config.get('collection', {}).get('result_limit', 50)]
+                        # 限制返回数量（默认值取唯一事实来源 site_caps；配置可覆盖）
+                        results = results[:self.zhihu_config.get('collection', {}).get('result_limit', SITE_ROUND_CAPS["zhihu"])]
                         
                         if results:
                             return results

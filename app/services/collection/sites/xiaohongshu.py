@@ -17,6 +17,12 @@ from ....utils.id_generator import generate_content_id
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠标题关键词启发式（见 _is_mock_data）。
 # 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
 from ..mock_utils import MOCK_FLAG, is_mock_record, fallback_or_empty
+# 站点单轮产出上界（唯一事实来源：app/services/collection/site_caps.py）
+from ..site_caps import SITE_ROUND_CAPS
+
+# xiaohongshu 的【终】上界：JSON 分支与 BS 分支各自 return 前的 `unique_data[:30]` 都改用它。
+# ⚠️ `feeds[:30]`、`note_items[:30]` 是【预】遍历上限，**不在**容量模型内，保持原样。
+_MAX = SITE_ROUND_CAPS["xiaohongshu"]
 
 
 class XiaohongshuSite(BaseSite):
@@ -401,7 +407,7 @@ class XiaohongshuSite(BaseSite):
                 seen_titles.add(item['title'])
                 unique_data.append(item)
                 
-        hot_data = unique_data[:30]  # 限制最多30条
+        hot_data = unique_data[:_MAX]  # 限制最多 _MAX 条（容量上界，见 site_caps）
         
         # 格式化数据
         for i, item in enumerate(hot_data):
@@ -673,7 +679,7 @@ class XiaohongshuSite(BaseSite):
                 seen_titles.add(item['title'])
                 unique_data.append(item)
                 
-        hot_data = unique_data[:30]  # 限制最多30条
+        hot_data = unique_data[:_MAX]  # 限制最多 _MAX 条（容量上界，见 site_caps）
         
         # 格式化数据
         for i, item in enumerate(hot_data):

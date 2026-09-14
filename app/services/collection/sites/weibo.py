@@ -13,6 +13,13 @@ from ....utils.id_generator import generate_content_id
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
 # 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
 from ..mock_utils import MOCK_FLAG, fallback_or_empty
+# 站点单轮产出上界（唯一事实来源：app/services/collection/site_caps.py）
+from ..site_caps import SITE_ROUND_CAPS
+
+# weibo 的【终】上界：三条返回路径（浏览器自动化 / API / 备用 HTML 解析）的最终上界
+# 一致为 50。⚠️ `rows[:50]`、`links[:50]`（HTML 解析分支）是【预】遍历上限，
+# **不在**容量模型内，保持原样。
+_MAX = SITE_ROUND_CAPS["weibo"]
 
 try:
     from playwright.async_api import async_playwright
@@ -107,7 +114,7 @@ class WeiboSite(BaseSite):
                             results.append({"fields": result})
                             
                     # 限制返回数量
-                    results = results[:50]
+                    results = results[:_MAX]
                     
                     if results:
                         return results
@@ -172,7 +179,7 @@ class WeiboSite(BaseSite):
                             results.append({"fields": result})
                             
                     # 限制返回数量
-                    results = results[:50]
+                    results = results[:_MAX]
                     
                     # 如果没有获取到数据，使用备用方案
                     if not results:
@@ -297,7 +304,7 @@ class WeiboSite(BaseSite):
                 seen_titles.add(item['title'])
                 unique_data.append({"fields": item})
                 
-        return unique_data[:50]
+        return unique_data[:_MAX]
     
     def _get_mock_data(self) -> List[Dict[str, Any]]:
         """获取模拟数据（用于演示或备用）。

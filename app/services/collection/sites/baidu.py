@@ -14,6 +14,12 @@ from ....utils.id_generator import generate_content_id
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
 # 有测试锁：tests/test_mock_governance.py（动态枚举所有含 _get_mock_data 的站点）。
 from ..mock_utils import MOCK_FLAG, fallback_or_empty
+# 站点单轮产出上界（唯一事实来源：app/services/collection/site_caps.py）
+from ..site_caps import SITE_ROUND_CAPS
+
+# baidu 的【终】上界：下方两处 `[:50]` 均**兼作最终上界**（返回对象即这两处结果，
+# 无独立终截断），故两处都改用它。
+_MAX = SITE_ROUND_CAPS["baidu"]
 
 
 class BaiduSite(BaseSite):
@@ -65,7 +71,7 @@ class BaiduSite(BaseSite):
             pattern = r'"word":"([^"]+)","hotScore":"([^"]+)","url":"([^"]+)"'
             matches = re.findall(pattern, html_text)
             
-            for i, match in enumerate(matches[:50]):  # 限制最多50条
+            for i, match in enumerate(matches[:_MAX]):  # 限制最多 _MAX 条（容量上界，见 site_caps）
                 # 使用统一的ID生成函数
                 content_id = generate_content_id()
                 
@@ -86,7 +92,7 @@ class BaiduSite(BaseSite):
             if not hot_data:
                 soup = BeautifulSoup(html_text, 'html.parser')
                 # 百度热搜榜的条目容器
-                items = soup.find_all('div', class_='category-wrap_iQLoo')[:50]
+                items = soup.find_all('div', class_='category-wrap_iQLoo')[:_MAX]
                 
                 for i, item in enumerate(items):
                     try:

@@ -12,6 +12,11 @@ from ....utils.id_generator import generate_content_id
 # 目的：让「mock 不得入库」由**意图**保证，而不是靠「忘了给 mock 包 fields 这个 bug」。
 # 有测试锁：tests/test_mock_governance.py。
 from ..mock_utils import MOCK_FLAG, fallback_or_empty
+# 站点单轮产出上界（唯一事实来源：app/services/collection/site_caps.py）
+from ..site_caps import SITE_ROUND_CAPS
+
+# people_daily 的【终】上界：`find_all('item')[:50]` 无独立终截断，**兼作最终上界**。
+_MAX = SITE_ROUND_CAPS["people_daily"]
 
 
 class PeopleDailySite(BaseSite):
@@ -61,7 +66,7 @@ class PeopleDailySite(BaseSite):
         
         try:
             soup = BeautifulSoup(xml_text, 'xml')
-            items = soup.find_all('item')[:50]  # 限制最多50条
+            items = soup.find_all('item')[:_MAX]  # 限制最多 _MAX 条（容量上界，见 site_caps）
             
             for i, item in enumerate(items):
                 try:
