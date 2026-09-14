@@ -18,6 +18,17 @@ yaml、缺库时回退到最小解析，见 `load_enabled_sites`）。
   SITE_CAPS_LOCK_ONLY=1  只跑「锁」（registry + M5 使用点），供变异自证子进程使用
   SITE_CAPS_LOCK_CHILD=1 标记子进程（跳过变异自证自身，防递归）
 
+环境与卫生（显式回答「测试会不会污染仓库」）：
+  · 本测试**不创建 git worktree**、**不调用任何 git 命令**、**不写主仓库工作区**。
+    所有「临时树」由 `copy_min_tree()` 用 `tempfile.mkdtemp()` + `shutil.copytree()`
+    在系统临时目录下构造；子进程一律 `cwd=<临时目录>`（对 `<ROOT>` 只读取源码文本）。
+  · 每个临时树都在 `try/finally` 中以 `shutil.rmtree(..., ignore_errors=True)` 清理；
+    即便断言失败或子进程抛错，`finally` 仍执行，故不与系统临时目录残留。
+  · 因此本测试可在任意 cwd / detached HEAD / 已存在同名 worktree 的仓库上安全运行，
+    不改 `.git`、不在 `git status` 留痕（已用运行前后 `git status --porcelain` 不变验证）。
+  · 注：复盘报告中出现的「基线 worktree」来自**仓库外**的一次性对照脚本（`.workbuddy/`、
+    已 gitignore），**不是**本测试的一部分；本测试对 git 零依赖。
+
 退出码：0 = 全部通过；1 = 有失败。
 
     python tests/test_site_caps_budget.py
