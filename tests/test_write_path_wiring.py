@@ -18,6 +18,10 @@
       运行 test_collection_pipeline()，断言**真正传给 batch_add_records 的记录**里 mock==0。
   [4] **桩驱动跑真实 app/api/v1/endpoints/feishu.py 的 /sync**（N3）：混入带标记 mock，
       断言**真正传给 batch_add_records 的记录**里 mock==0。
+  [5] **桩驱动跑真实 script/collection_pipeline.py 的删除路径**：既有记录非空、入站含
+      **同 title 多记录**，断言传给 `delete_records` 的 id **无重复**、id 集合正确，且
+      日志主语数 == 唯一 id 数（不是 `delete_len_raw`）。此前假 `list_records` 固定返回
+      空集 ⇒ 这条会真删飞书的路径**只有文本锁**，行为从未被走过。
 
 依赖桩（**条件桩**；判据：桩的合法性 = 被桩模块的行为是否被断言依赖）：
   这里断言的是**写路径自身**的过滤行为；被桩的采集引擎/飞书 SDK/通知的行为**不被断言依赖**。
@@ -35,10 +39,13 @@
 # ---------------------------------------------------------------------------
 
 import asyncio
+import contextlib
 import datetime
 import importlib
 import importlib.util
+import io
 import os
+import re
 import sys
 import types
 
@@ -69,23 +76,33 @@ def _mod(name, **attrs):
 # 假件（写路径的行为不依赖它们的真实性，只借用其"接口"）
 # ---------------------------------------------------------------------------
 class _FakeFeishuService:
-    """记下最后一次 batch_add_records 收到的记录（断言的核心）。"""
+    """记下最后一次 batch_add_records 收到的记录（断言的核心）。
+
+    `list_items` 可配置（默认空）：用例 [5] 用它返回**非空**既有记录以触发删除分支。
+    `delete_calls` 记录每次 delete_records 收到的 id 列表（供 [5] 断言去重）。
+    """
 
     last = None
+    list_items = []          # 默认今日无既有记录 → 不触发去重/删除分支
 
     def __init__(self):
         _FakeFeishuService.last = self
         self.added = None
         self.deleted_count = 0
+        self.delete_calls = []
 
     async def ensure_table_fields(self, *a, **k):
         return True, "ok"
 
     async def list_records(self, *a, **k):
-        return {"items": []}          # 今日无既有记录 → 不触发去重/删除分支
+        return {"items": list(type(self).list_items)}   # 单页返回（无 page_token → 循环一轮即止）
 
     async def delete_records(self, *a, **k):
-        return 0
+        ids = a[2] if len(a) >= 3 else k.get("record_ids")
+        ids = list(ids or [])
+        self.delete_calls.append(ids)
+        self.deleted_count += len(ids)
+        return len(ids)
 
     async def ensure_capacity(self, app_token, table_id, incoming=0):
         return {"ok": True, "message": "ok", "count_after": incoming,
@@ -334,15 +351,74 @@ def test_stub_driven_feishu_sync_n3():
         check("[4] /sync 仅保留 2 条真实记录", len(captured) == 2, f"len={len(captured)}")
 
 
+# ---------------------------------------------------------------------------
+# [5] 桩驱动真实 pipeline：records_to_delete 去重分支（会真删飞书记录的路径）
+# ---------------------------------------------------------------------------
+def test_records_to_delete_dedup():
+    """同一 title 的多个入站记录 → 传给 batch_delete 的 id **无重复**、日志主语=唯一数。
+
+    历史形态：多个入站记录共享同一 title 时，`title_to_record_ids[title][0]` 会被 append
+    多次 → 删除接口收到重复 id；且日志「需要删除 N」曾用的是**列表长度（含重复）**而非
+    唯一数，被误判成「幽灵写入 +5」。本用例用**非空既有记录 + 同 title 双入站**构造出该
+    形态，直接走在真实的 script/collection_pipeline.py 删除路径上断言。
+    """
+    print("\n[5] 去重分支：同 title 的多个入站记录 → batch_delete 收到唯一 id")
+    _install_light_stubs()
+
+    # 既有记录：每个 title 只有 1 条 ⇒ duplicate_titles 为空 ⇒ 第一个删除块不触发，
+    # 从而**隔离**出第 253-276 行的「重建删除集」分支；但 title 在 title_to_record_ids 中
+    # ⇒ 入站同 title 记录都会命中并 append 同一个既有 record_id。
+    _FakeFeishuService.list_items = [
+        {"record_id": "recA", "fields": {"title": "重复标题", "collected_at": "2026-01-01 00:00:00"}},
+        {"record_id": "recB", "fields": {"title": "唯一标题", "collected_at": "2026-01-01 00:00:00"}},
+    ]
+    _FakeEngine.results = [
+        {"site_code": "s1", "collect_time": "t", "data_count": 2,
+         "news": [_mk_news("重复标题"), _mk_news("重复标题")]},   # 两条同 title
+    ]
+
+    spec = importlib.util.spec_from_file_location(
+        "_pipeline_under_test", os.path.join(ROOT, "script", "collection_pipeline.py"))
+    pipeline = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pipeline)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        ok = asyncio.run(pipeline.test_collection_pipeline())
+    out = buf.getvalue()
+
+    svc = _FakeFeishuService.last
+    check("[5] 流水线执行成功返回 True", ok is True, f"ok={ok}")
+    check("[5] 只发生 1 次 delete_records 调用（隔离『重建删除集』分支）",
+          len(svc.delete_calls) == 1, f"delete_calls={svc.delete_calls!r}")
+    last_ids = svc.delete_calls[-1] if svc.delete_calls else []
+    check("[5] batch_delete 收到的 id 列表**无重复**",
+          len(set(last_ids)) == len(last_ids), f"ids={last_ids!r}")
+    check("[5] batch_delete 的 id **集合** == {'recA'}",
+          set(last_ids) == {"recA"}, f"ids={last_ids!r}")
+
+    m = re.search(r"需要删除 (\d+) 条已存在记录（入站 (\d+) 条", out)
+    check("[5] 日志文案可解析（需删除 N / 入站 raw）", m is not None,
+          "未匹配到『需要删除 …（入站 …）』")
+    if m:
+        subject, raw = int(m.group(1)), int(m.group(2))
+        # 场景自证：raw=2 说明确实构造了「同 title 多入站」的重复形态（否则本用例没走到去重）
+        check("[5] 场景自证：入站 raw=2 确含重复 id", raw == 2, f"raw={raw}")
+        # 主语必须等于**唯一 id 数**，而不是 delete_len_raw（历史 bug 的混淆点）
+        check("[5] 日志主语数 == 唯一 id 数（不是 delete_len_raw）",
+              subject == len(set(last_ids)), f"subject={subject} unique={len(set(last_ids))}")
+
+
 def main():
     print("=" * 70)
-    print("写路径行为级接线锁（离线）：split_write_set / build_headline_records / 桩驱动 pipeline / N3")
+    print("写路径行为级接线锁（离线）：split_write_set / build_headline_records / 桩驱动 pipeline / N3 / 删除去重")
     print("=" * 70)
 
     test_split_write_set_behavior()
     test_build_headline_records_behavior()
     test_stub_driven_pipeline()
     test_stub_driven_feishu_sync_n3()
+    test_records_to_delete_dedup()
 
     print("=" * 70)
     print(f"结果: {len(PASSED)} 通过 / {len(FAILED)} 失败")
