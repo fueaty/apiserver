@@ -216,9 +216,10 @@ python tests/<name>.py        # 退出码 0 = 全通过
   沿用任一份都会**静默少发文件**（旧流程实际丢过 2 个新增文件）。该目录已被 gitignore，不在仓库跟踪范围内。
 - 生产**无 systemd 服务**：改代码不需要重启任何进程，下一次 cron 即生效。
 - 容器化路径与生产当前形态**不同**，不要混用。`docker-compose.yml` 的 4 个服务是
-  `apiserver` / `redis` / `mongodb` / `playwright`；而 `deploy.sh:59` / `:77` 却在检查 `api` 与
-  `celery-worker` —— 这两个服务名**在 compose 里并不存在**，即该脚本的健康检查永远不可能通过
-  （真 bug，未修）。
+  `apiserver` / `redis` / `mongodb` / `playwright`。历史上 `deploy.sh` 检查的 `api` 与
+  `celery-worker` 这两个服务名**在 compose 里并不存在**（即健康检查永远不可能通过）；
+  已修（`2947c84`：`api` → `apiserver`，并**删除**永不成立的 worker 检查块，而**非**改查
+  无关服务——那是掩盖），由 `tests/test_deploy_service_names.py` 持续守护。
 
 运维与排障细节见 `doc/DEPLOY.md`、`doc/DEPLOYMENT.md`、`doc/服务器优化指南.md`。
 
@@ -267,5 +268,6 @@ python tests/<name>.py        # 退出码 0 = 全通过
   （实为**已有**，缺的只是预检）、`docker-compose.yml` 真实服务名与 `deploy.sh` 的不一致、
   zhihu 配置的**硬编码路径 + 嵌套键**、测试「结果行」的适用范围（12/22）、三份旧清单所在目录
   （`.workbuddy/_deploy/`，gitignored）、站点级缺口告警的存在。
+- 2026-09-14：§八 的 `deploy.sh` 服务名问题**已修**（`2947c84`），README 同步更新（原文写「未修」已过期）。
 
 如发现本文与代码不符，**以代码为准**，并提交修正。
