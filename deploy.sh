@@ -56,7 +56,7 @@ else
 fi
 
 # 检查API服务
-if docker-compose ps api | grep -q "Up"; then
+if docker-compose ps apiserver | grep -q "Up"; then
     echo "✅ API服务运行正常"
     
     # 测试健康检查接口
@@ -64,23 +64,21 @@ if docker-compose ps api | grep -q "Up"; then
         echo "✅ 健康检查接口正常"
     else
         echo "❌ 健康检查接口异常"
-        docker-compose logs api
+        docker-compose logs apiserver
         exit 1
     fi
 else
     echo "❌ API服务启动失败"
-    docker-compose logs api
+    docker-compose logs apiserver
     exit 1
 fi
 
-# 检查Celery Worker服务
-if docker-compose ps celery-worker | grep -q "Up"; then
-    echo "✅ Celery Worker服务运行正常"
-else
-    echo "❌ Celery Worker服务启动失败"
-    docker-compose logs celery-worker
-    exit 1
-fi
+# 说明：此处原有「Celery Worker 健康检查」（`docker-compose ps celery-worker`），
+# 但 docker-compose.yml 的 services 只定义了 apiserver / redis / mongodb / playwright，
+# **没有 worker 服务** ⇒ 该检查永远不可能 Up（写死却永不成立的静默失效）。
+# 生产的实际执行路径是 cron 批任务（script/run_daily_task.sh），worker 不容器化。
+# 故删除该检查块；**不**改为检查 mongodb / playwright 等无关服务（那是掩盖问题）。
+# 该禁令由 tests/test_deploy_service_names.py 持续守护。
 
 echo ""
 echo "🎉 部署完成！"
