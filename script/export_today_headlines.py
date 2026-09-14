@@ -13,6 +13,9 @@ from datetime import datetime, timedelta
 
 # 添加项目根目录到Python路径
 # sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# ⚠️ 下面这行仍依赖运行时 cwd（".." 按 cwd 解析），本次修复范围**仅输出路径**，故不动它。
+#    部署侧由 run_daily_task.sh 的 PYTHONPATH="$APISERVER_HOME" 兜底导入，
+#    everday_task.py 也以 <root> 为 cwd 调起本脚本，故实际始终能找到 app 包。
 sys.path.append("..")
 from app.services.feishu.feishu_service import FeishuService
 from app.core.config import config_manager
@@ -40,6 +43,11 @@ def resolve_output_path(output_file: str = None) -> str:
         - output_file 为 None → ``<root>/{today}_headlines_data.json``
         - output_file 为绝对路径 → 原样返回
         - output_file 为相对路径 → ``<root>/<output_file>``
+
+    Note:
+        ⚠️ 以 ``"../"`` 开头的入参会得到 ``<root>/../<name>``（项目根的**父目录**），
+        与旧行为不同（旧代码把 ``"../x.json"`` 原样按 cwd 解析）。生产入口
+        ``everday_task.py`` 从不传参；手工调用请用绝对路径或纯文件名。
     """
     if output_file is None:
         return str(PROJECT_ROOT / f"{today}_headlines_data.json")

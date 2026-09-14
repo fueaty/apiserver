@@ -4,11 +4,19 @@
 站点单轮上限名录 + 容量守卫回归测试（app/services/collection/site_caps.py）
 
 对应设计 `.workbuddy/_next/站点上限守卫设计.md` §3.3 的 M1–M7。
-全部为**离线、无网络、无第三方依赖**断言（仅标准库 + 站点源码文本/AST 扫描）。
+全部为**离线、无网络**断言（仅标准库 + 站点源码文本/AST 扫描；读 sites.yaml 优先用
+yaml、缺库时回退到最小解析，见 `load_enabled_sites`）。
 
-为什么要这些"变异对照"：本项目已三次踩"断言绿但无鉴别力"的坑
-（``all([])==True``、站点枚举写死、接线锁只查文本）。故 M1–M7 每条都给出
-**变异靶点 → 期望变红**，证明守卫/接线锁**真的读了真实代码路径**，而非摆设。
+本文件有两层，别混淆：
+  · 守卫（生产）：`site_caps.py` import 期 G1/G2 —— 由 M1/M2 用**独立子进程**证明会 raise。
+  · 锁（测试）：名录闭包 + sites.yaml 交叉 + **「使用点」接线锁**（M5）。
+    M5 是本项目第四次尝试「接线锁」——前三次都栽在「只查形状/文本」。
+    故 M5 既查**赋值形状**，又查**切片使用点个数**与**旧裸字面量缺失**，
+    并用 **14 个位置的变异自证**证明「把任一处还原成裸字面量 → 锁必变红」。
+
+环境变量（内部用，防递归）：
+  SITE_CAPS_LOCK_ONLY=1  只跑「锁」（registry + M5 使用点），供变异自证子进程使用
+  SITE_CAPS_LOCK_CHILD=1 标记子进程（跳过变异自证自身，防递归）
 
 退出码：0 = 全部通过；1 = 有失败。
 
@@ -29,10 +37,12 @@ sys.path.insert(0, ROOT)
 SITE_CAPS_PATH = os.path.join(ROOT, "app", "services", "collection", "site_caps.py")
 SITES_DIR = os.path.join(ROOT, "app", "services", "collection", "sites")
 RUN_DAILY_SH = os.path.join(ROOT, "script", "run_daily_task.sh")
+SITES_YAML = os.path.join(ROOT, "config", "sites.yaml")
+
+LOCK_ONLY = os.environ.get("SITE_CAPS_LOCK_ONLY") == "1"
+IS_CHILD = os.environ.get("SITE_CAPS_LOCK_CHILD") == "1"
 
 # 站点 → (站点模块相对路径, 该站"命名上界常量"名 or None)
-# thepaper 用既有公开名 MAX_RESULTS；其余 8 站用内部名 _MAX；
-# zhihu 无模块级常量（其上界是 `.get('result_limit', SITE_ROUND_CAPS["zhihu"])` 的默认值）。
 SITE_FILES = {
     "people_daily": ("app/services/collection/sites/people_daily.py", "_MAX"),
     "xinhua": ("app/services/collection/sites/xinhua.py", "_MAX"),
@@ -45,11 +55,70 @@ SITE_FILES = {
     "xiaohongshu": ("app/services/collection/sites/xiaohongshu.py", "_MAX"),
 }
 
-# §1.3 的设计基线（真·单轮上界）
 EXPECTED_CAPS = {
     "people_daily": 50, "xinhua": 30, "cctv": 50, "thepaper": 100,
     "weibo": 50, "baidu": 50, "zhihu": 50, "tech_36kr": 50, "xiaohongshu": 30,
 }
+
+# —— M5(a) 计数锁：每文件「哨兵切片」个数（AST 数 Subscript(Slice(lower=None, upper=Name(哨兵)))）——
+SENTINEL_SLICE_COUNT = {
+    "app/services/collection/sites/baidu.py": 2,
+    "app/services/collection/sites/cctv.py": 1,
+    "app/services/collection/sites/people_daily.py": 1,
+    "app/services/collection/sites/tech_36kr.py": 1,
+    "app/services/collection/sites/thepaper.py": 2,
+    "app/services/collection/sites/weibo.py": 3,
+    "app/services/collection/sites/xiaohongshu.py": 2,
+    "app/services/collection/sites/xinhua.py": 1,
+}
+SENTINEL_NAMES = {"_MAX", "MAX_RESULTS"}
+
+# —— M5(b) 负面锁：每个旧裸字面量形态在该文件中必须出现 0 次 ——
+NEGATIVE_LITERALS = {
+    "app/services/collection/sites/baidu.py": ["matches[:50]", "category-wrap_iQLoo')[:50]"],
+    "app/services/collection/sites/cctv.py": ["unique_data[:50]"],
+    "app/services/collection/sites/people_daily.py": ["find_all('item')[:50]"],
+    "app/services/collection/sites/tech_36kr.py": ["find_all('item')[:50]"],
+    "app/services/collection/sites/thepaper.py": ["results[:100]"],
+    "app/services/collection/sites/weibo.py": ["results[:50]", "unique_data[:50]"],
+    "app/services/collection/sites/xiaohongshu.py": ["unique_data[:30]"],
+    "app/services/collection/sites/xinhua.py": ["unique_data[:30]"],
+    "app/services/collection/sites/zhihu.py": ["result_limit', 50"],
+}
+
+# —— M5(c) 变异自证：14 个位置（含同形重复的第 index 次出现）——
+# (相对路径, 当前哨兵片段, 旧裸字面量片段, 第几次出现(0-based), 人类可读标签)
+POSITIONS = [
+    ("app/services/collection/sites/baidu.py", "matches[:_MAX]", "matches[:50]", 0,
+     "baidu matches[:_MAX]"),
+    ("app/services/collection/sites/baidu.py", "category-wrap_iQLoo')[:_MAX]",
+     "category-wrap_iQLoo')[:50]", 0, "baidu find_all('div',...)[:_MAX]"),
+    ("app/services/collection/sites/cctv.py", "unique_data[:_MAX]", "unique_data[:50]", 0,
+     "cctv unique_data[:_MAX]"),
+    ("app/services/collection/sites/people_daily.py", "find_all('item')[:_MAX]",
+     "find_all('item')[:50]", 0, "people_daily find_all('item')[:_MAX]"),
+    ("app/services/collection/sites/tech_36kr.py", "find_all('item')[:_MAX]",
+     "find_all('item')[:50]", 0, "tech_36kr find_all('item')[:_MAX]"),
+    ("app/services/collection/sites/thepaper.py", "results[:MAX_RESULTS]",
+     "results[:100]", 0, "thepaper results[:MAX_RESULTS] (#1 try 内)"),
+    ("app/services/collection/sites/thepaper.py", "results[:MAX_RESULTS]",
+     "results[:100]", 1, "thepaper results[:MAX_RESULTS] (#2 return 前)"),
+    ("app/services/collection/sites/weibo.py", "results = results[:_MAX]",
+     "results = results[:50]", 0, "weibo results[:_MAX] (#1 浏览器路径)"),
+    ("app/services/collection/sites/weibo.py", "results = results[:_MAX]",
+     "results = results[:50]", 1, "weibo results[:_MAX] (#2 API 路径)"),
+    ("app/services/collection/sites/weibo.py", "return unique_data[:_MAX]",
+     "return unique_data[:50]", 0, "weibo unique_data[:_MAX]"),
+    ("app/services/collection/sites/xiaohongshu.py", "hot_data = unique_data[:_MAX]",
+     "hot_data = unique_data[:30]", 0, "xiaohongshu unique_data[:_MAX] (#1 JSON)"),
+    ("app/services/collection/sites/xiaohongshu.py", "hot_data = unique_data[:_MAX]",
+     "hot_data = unique_data[:30]", 1, "xiaohongshu unique_data[:_MAX] (#2 BS)"),
+    ("app/services/collection/sites/xinhua.py", "hot_data = unique_data[:_MAX]",
+     "hot_data = unique_data[:30]", 0, "xinhua unique_data[:_MAX]"),
+    ("app/services/collection/sites/zhihu.py",
+     'get(\'result_limit\', SITE_ROUND_CAPS["zhihu"])', 'get(\'result_limit\', 50)', 0,
+     "zhihu result_limit 默认值"),
+]
 
 PASSED = []
 FAILED = []
@@ -69,46 +138,109 @@ def read_text(path):
         return f.read()
 
 
-# ---------------------------------------------------------------------------
-# 被测对象：真实 site_caps（import 会触发 G1/G2 守卫）
-# ---------------------------------------------------------------------------
+def write_text(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def code_only(text):
+    """只保留会真正执行的代码行（去掉空行与整行注释）。
+
+    负面锁只关心「**代码**是否回退成裸字面量」；注释里为了说明历史/陷阱而
+    提到旧字面量（例如「原 `unique_data[:50]`」）是合理的，不应被误伤
+    ——与 tests/test_capacity_budget.py 的 `_code_lines` 同款取舍。
+    """
+    out = []
+    for ln in text.splitlines():
+        s = ln.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
 def load_real_site_caps():
     from app.services.collection import site_caps
     return site_caps
 
 
-def run_site_caps_import_in_subprocess(source_text):
-    """把 source_text 写成临时目录下的 site_caps.py，用子进程 `import site_caps`。
+# ---------------------------------------------------------------------------
+# 临时「最小树」：供子进程 `import site_caps` / 跑锁 / `import thepaper` 用
+# ---------------------------------------------------------------------------
+_MIN_TREE_ITEMS = [
+    "app/__init__.py",
+    "app/services/__init__.py",
+    "app/services/collection/__init__.py",
+    "app/services/collection/site_caps.py",
+    "app/services/collection/sites",
+    "app/services/collection/mock_utils.py",
+    "app/services/feishu/__init__.py",
+    "app/services/feishu/limits.py",
+    "app/utils/__init__.py",
+    "app/utils/id_generator.py",
+    "config/sites.yaml",
+    "script/run_daily_task.sh",
+    "tests/test_site_caps_budget.py",
+]
 
-    返回 (returncode, stderr_text)。cwd 指向临时目录（`python -c` 会把 cwd 放到
-    sys.path[0]），因此导入的是这份**变异副本**；PYTHONPATH 指向仓库根，使副本里
-    的 `from app.services.feishu import limits` 仍能解析到**真实** limits（守卫要读
-    它的 WATERMARK）。
-    """
+
+def copy_min_tree(dst):
+    """把跑测试所需的最小文件集合复制到 dst（跳过 __pycache__）。"""
+    for rel in _MIN_TREE_ITEMS:
+        src = os.path.join(ROOT, rel)
+        if not os.path.exists(src):
+            continue
+        target = os.path.join(dst, rel)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if os.path.isdir(src):
+            shutil.copytree(src, target,
+                            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        else:
+            shutil.copy2(src, target)
+
+
+def run_lock_in_subprocess(tree_root):
+    """在 tree_root 里跑「锁」（LOCK_ONLY=1），返回 (rc, 输出文本)。"""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = tree_root + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["SITE_CAPS_LOCK_ONLY"] = "1"
+    env["SITE_CAPS_LOCK_CHILD"] = "1"
+    proc = subprocess.run(
+        [sys.executable, os.path.join(tree_root, "tests", "test_site_caps_budget.py")],
+        cwd=tree_root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    return proc.returncode, proc.stdout.decode("utf-8", "replace")
+
+
+def run_site_caps_import_in_subprocess(source_text):
     tmp = tempfile.mkdtemp(prefix="site_caps_")
     try:
-        with open(os.path.join(tmp, "site_caps.py"), "w", encoding="utf-8") as f:
-            f.write(source_text)
+        write_text(os.path.join(tmp, "site_caps.py"), source_text)
         env = dict(os.environ)
         env["PYTHONPATH"] = ROOT + os.pathsep + env.get("PYTHONPATH", "")
         env["PYTHONDONTWRITEBYTECODE"] = "1"
-        proc = subprocess.run(
-            [sys.executable, "-c", "import site_caps"],
-            cwd=tmp,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        return proc.returncode, proc.stderr.decode("utf-8", errors="replace")
+        proc = subprocess.run([sys.executable, "-c", "import site_caps"],
+                              cwd=tmp, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return proc.returncode, proc.stderr.decode("utf-8", "replace")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def replace_occurrence(text, old, new, idx):
+    """把 text 中第 idx 次（0-based）出现的 old 换成 new；不足则返回 None。"""
+    if text.count(old) <= idx:
+        return None
+    pos = -1
+    for _ in range(idx + 1):
+        pos = text.index(old, pos + 1)
+    return text[:pos] + new + text[pos + len(old):]
+
+
 # ---------------------------------------------------------------------------
-# 名录闭包：从**真实站点源码**（AST）取"被声明的上界键"，与名录交叉
+# 名录闭包（AST，站点源码 vs 名录）
 # ---------------------------------------------------------------------------
 def referenced_cap_keys():
-    """扫描 sites/*.py，收集所有 `SITE_ROUND_CAPS["<key>"]` 里引用的键。"""
     keys = set()
     for name in sorted(os.listdir(SITES_DIR)):
         if not name.endswith(".py") or name == "__init__.py":
@@ -125,11 +257,6 @@ def referenced_cap_keys():
 
 
 def closure_check(registry):
-    """名录闭包：站点声明的上界键 与 名录键 必须**互为子集**（即相等）。
-
-    - 站点声明了未登记的键 → ValueError（"名录闭包：站点声明了未登记的上界"）
-    - 名录里有多余的键（无站点声明 / 已停用）→ ValueError（"名录残留死人"）
-    """
     ref = referenced_cap_keys()
     missing = sorted(ref - set(registry))
     if missing:
@@ -141,7 +268,40 @@ def closure_check(registry):
 
 
 # ---------------------------------------------------------------------------
-# M5 用：AST 判定"某命名常量是否取自 SITE_ROUND_CAPS[key]"
+# sites.yaml enabled 集合（优先 yaml，缺库回退最小解析）
+# ---------------------------------------------------------------------------
+def _minimal_enabled_parse(text):
+    enabled = set()
+    cur = None
+    for raw in text.splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        m = re.match(r"^  ([A-Za-z_][A-Za-z0-9_]*):\s*$", raw)
+        if m:
+            cur = m.group(1)
+            enabled.add(cur)  # 缺 enabled 时默认 True（对齐 test_target_sites）
+            continue
+        m2 = re.match(r"^\s+enabled:\s*(\S+)\s*$", raw)
+        if m2 and cur:
+            if m2.group(1).lower() not in ("true", "yes", "on"):
+                enabled.discard(cur)
+    return enabled
+
+
+def load_enabled_sites():
+    text = read_text(SITES_YAML)
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(text) or {}
+        sites = data.get("sites", {}) or {}
+        return set(k for k, v in sites.items() if (v or {}).get("enabled", True))
+    except Exception:
+        return _minimal_enabled_parse(text)
+
+
+# ---------------------------------------------------------------------------
+# M5 用：AST 判定「命名常量是否取自 SITE_ROUND_CAPS[key]」/「引用键」
 # ---------------------------------------------------------------------------
 def _named_binding_is_lookup(src, const_name, key):
     tree = ast.parse(src)
@@ -182,8 +342,21 @@ def _imports_site_round_caps(src):
     return False
 
 
+def _sentinel_slice_count(src):
+    tree = ast.parse(src)
+    n = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Subscript):
+            sl = node.slice
+            if (isinstance(sl, ast.Slice) and sl.lower is None
+                    and isinstance(sl.upper, ast.Name)
+                    and sl.upper.id in SENTINEL_NAMES):
+                n += 1
+    return n
+
+
 # ---------------------------------------------------------------------------
-# M7 用：数 run_daily_task.sh 头部的 cron 行
+# M7 用：cron 行
 # ---------------------------------------------------------------------------
 _CRON_RE = re.compile(r"^\s*#\s*(\S+\s+){4}\S+.*run_daily_task\.sh\s*$", re.M)
 
@@ -193,13 +366,98 @@ def cron_line_count(sh_text):
 
 
 def rounds_consistency_ok(sh_text, rounds_per_day):
-    """轮次假设是否与调度源一致：cron 行数 == ROUNDS_PER_DAY。"""
     return cron_line_count(sh_text) == rounds_per_day
 
 
-# ---------------------------------------------------------------------------
-# 用例
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# 锁（LOCK_ONLY 子进程只跑这一段）
+# ===========================================================================
+def test_registry_lock():
+    print("\n[L1] 名录闭包 + sites.yaml 交叉（锁）")
+    s = load_real_site_caps()
+    raised, msg = False, ""
+    try:
+        closure_check(s.SITE_ROUND_CAPS)
+    except ValueError as e:
+        raised, msg = True, str(e)
+    check("L1a 真实名录闭包成立（声明键 == 名录键）", not raised, msg)
+
+    enabled = load_enabled_sites()
+    check("L1b 真实名录键 == sites.yaml enabled 集合",
+          set(s.SITE_ROUND_CAPS) == enabled,
+          "caps=%s enabled=%s" % (sorted(s.SITE_ROUND_CAPS), sorted(enabled)))
+
+
+def test_m5_usage_lock():
+    print("\n[M5] 「使用点」接线锁：赋值形状 + 切片计数 + 旧裸字面量缺失")
+    s = load_real_site_caps()
+    for key, (relpath, cname) in SITE_FILES.items():
+        path = os.path.join(ROOT, relpath)
+        src = read_text(path)
+        check("%s import SITE_ROUND_CAPS" % key, _imports_site_round_caps(src), relpath)
+        check("%s 引用名录键 '%s'" % (key, key), _references_key(src, key), relpath)
+        if cname is not None:
+            check("%s 的 %s 取自 SITE_ROUND_CAPS['%s']" % (key, cname, key),
+                  _named_binding_is_lookup(src, cname, key), relpath)
+        check("%s 名录值 == %d" % (key, EXPECTED_CAPS[key]),
+              s.SITE_ROUND_CAPS.get(key) == EXPECTED_CAPS[key], s.SITE_ROUND_CAPS.get(key))
+
+    # (a) 切片使用点计数锁（AST）
+    for relpath, expected in SENTINEL_SLICE_COUNT.items():
+        got = _sentinel_slice_count(read_text(os.path.join(ROOT, relpath)))
+        check("M5a %s 哨兵切片数 == %d" % (relpath, expected), got == expected, "got=%d" % got)
+
+    # (b) 负面锁：旧裸字面量在**代码行**中 0 次
+    for relpath, literals in NEGATIVE_LITERALS.items():
+        src = code_only(read_text(os.path.join(ROOT, relpath)))
+        for lit in literals:
+            check("M5b %s 代码行不含 %r" % (relpath, lit), src.count(lit) == 0,
+                  "count=%d" % src.count(lit))
+
+    # zhihu 正向：默认值取自名录
+    zh = read_text(os.path.join(ROOT, SITE_FILES["zhihu"][0]))
+    check('M5 zhihu 默认值取自 SITE_ROUND_CAPS["zhihu"]',
+          'SITE_ROUND_CAPS["zhihu"]' in zh and "result_limit', 50" not in zh)
+
+
+# ===========================================================================
+# 变异自证（仅父进程；子进程 LOCK_ONLY 不跑，防递归）
+# ===========================================================================
+def test_m5_mutation_selfproof():
+    print("\n[M5c] 变异自证：未变异对照 + 14 个位置逐个还原成裸字面量 -> 锁必须变红")
+
+    # 对照：整树复制但**不**变异 -> 锁必须绿（证明子进程锁不是"恒红"）
+    ctrl = tempfile.mkdtemp(prefix="site_caps_ctl_")
+    try:
+        copy_min_tree(ctrl)
+        rc, out = run_lock_in_subprocess(ctrl)
+        check("M5c#00 未变异对照 -> 锁为绿", rc == 0,
+              "rc=%s out=%s" % (rc, out.strip().splitlines()[-1:]))
+    finally:
+        shutil.rmtree(ctrl, ignore_errors=True)
+
+    for i, (relpath, sentinel, legacy, occ, label) in enumerate(POSITIONS, 1):
+        work = tempfile.mkdtemp(prefix="site_caps_mut_")
+        try:
+            copy_min_tree(work)
+            target = os.path.join(work, relpath)
+            src = read_text(target)
+            mutated = replace_occurrence(src, sentinel, legacy, occ)
+            if mutated is None or mutated == src:
+                check("M5c#%02d %s 变异可施加" % (i, label), False,
+                      "snippet=%r occ=%d" % (sentinel, occ))
+                continue
+            write_text(target, mutated)
+            rc, out = run_lock_in_subprocess(work)
+            check("M5c#%02d %s -> 锁变红" % (i, label), rc != 0,
+                  "rc=%s out=%s" % (rc, out.strip().splitlines()[-1:] if out else ""))
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+
+
+# ===========================================================================
+# 守卫 / 行为
+# ===========================================================================
 def test_real_values():
     print("\n[0] 真实 site_caps 的名录与守卫现值")
     s = load_real_site_caps()
@@ -213,31 +471,20 @@ def test_real_values():
     check("ACKNOWLEDGED_WORST_CASE_DAILY == 920",
           s.ACKNOWLEDGED_WORST_CASE_DAILY == 920, s.ACKNOWLEDGED_WORST_CASE_DAILY)
     check("cap_for('thepaper') == 100", s.cap_for("thepaper") == 100, s.cap_for("thepaper"))
-    # 导入期 G1/G2 已成立（能 import 到这一步即证明没 raise）
-    check("G1 单轮 Σ(上界) <= WATERMARK", s.PER_ROUND_CAP_TOTAL <= __import__(
-        "app.services.feishu.limits", fromlist=["WATERMARK"]).WATERMARK)
-
-
-def test_closure_real():
-    print("\n[0b] 名录闭包（真实名录 vs 真实站点源码 AST）")
-    s = load_real_site_caps()
-    check("真实名录闭包成立（声明键 == 名录键）",
-          closure_check(s.SITE_ROUND_CAPS) is True, "closure_check 未通过")
 
 
 def test_control_import_ok():
-    print("\n[A] 对照：未变异的 site_caps.py 子进程导入成功")
+    print("\n[A] 对照：未变异 site_caps.py 子进程导入成功")
     rc, err = run_site_caps_import_in_subprocess(read_text(SITE_CAPS_PATH))
     check("未变异副本退出码 0", rc == 0, "rc=%s stderr=%s" % (rc, err[-400:]))
 
 
 def test_m1_thepaper_9999():
-    print("\n[M1] thepaper 100 -> 9999：G2 棘轮必须 raise")
+    print("\n[M1] thepaper 100 -> 9999：G2 棘轮必须 raise（独立子进程）")
     src = read_text(SITE_CAPS_PATH)
     old, new = '"thepaper": 100', '"thepaper": 9999'
     check("变异靶点存在且唯一", src.count(old) == 1, "count=%d" % src.count(old))
     mutated = src.replace(old, new, 1)
-    check("文本确已改变", mutated != src)
     rc, err = run_site_caps_import_in_subprocess(mutated)
     check("M1 非 0 退出", rc != 0, "rc=%s" % rc)
     check("M1 stderr 含 ValueError", "ValueError" in err, err[-300:])
@@ -245,72 +492,71 @@ def test_m1_thepaper_9999():
 
 
 def test_m2_people_daily_99999():
-    print("\n[M2] people_daily 50 -> 99999：G1 单轮可写性必须 raise")
+    print("\n[M2] people_daily 50 -> 99999：G1 单轮可写性必须 raise（独立子进程）")
     src = read_text(SITE_CAPS_PATH)
     old, new = '"people_daily": 50', '"people_daily": 99999'
     check("变异靶点存在且唯一", src.count(old) == 1, "count=%d" % src.count(old))
     mutated = src.replace(old, new, 1)
-    check("文本确已改变", mutated != src)
     rc, err = run_site_caps_import_in_subprocess(mutated)
     check("M2 非 0 退出", rc != 0, "rc=%s" % rc)
     check("M2 stderr 含 ValueError", "ValueError" in err, err[-300:])
     check("M2 stderr 含 G1 文案", "G1" in err, err[-300:])
 
 
-def test_m3_missing_entry():
-    print("\n[M3] 名录删掉 'thepaper'，但 thepaper.py 仍声明 MAX_RESULTS -> 闭包 ValueError")
-    s = load_real_site_caps()
-    reg = dict(s.SITE_ROUND_CAPS)
-    reg.pop("thepaper", None)
-    raised = False
-    msg = ""
+def test_m3_production_keyerror():
+    print("\n[M3] 生产行为：真删名录 'thepaper' 条目 -> import thepaper 必须 KeyError")
+    work = tempfile.mkdtemp(prefix="site_caps_m3_")
     try:
-        closure_check(reg)
-    except ValueError as e:
-        raised, msg = True, str(e)
-    check("M3 闭包检查 raise ValueError", raised, "未 raise")
-    check("M3 文案指向「站点声明了未登记的上界」", "未登记" in msg, msg)
+        copy_min_tree(work)
+        scpath = os.path.join(work, "app", "services", "collection", "site_caps.py")
+        src = read_text(scpath)
+        old = '    "thepaper": 100,\n'
+        check("M3 变异靶点存在且唯一", src.count(old) == 1, "count=%d" % src.count(old))
+        write_text(scpath, src.replace(old, "", 1))
+        # 子进程 import thepaper（桩 aiohttp，避免依赖；site_caps['thepaper'] 缺失 -> KeyError）
+        code = (
+            "import sys, types\n"
+            "sys.path.insert(0, %r)\n"
+            "a = types.ModuleType('aiohttp');\n"
+            "a.ClientSession = a.ClientTimeout = a.TCPConnector = object\n"
+            "sys.modules['aiohttp'] = a\n"
+            "import app.services.collection.sites.thepaper\n"
+        ) % work
+        env = dict(os.environ)
+        env["PYTHONPATH"] = work + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc = subprocess.run([sys.executable, "-c", code], cwd=work, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        err = proc.stderr.decode("utf-8", "replace")
+        check("M3 import thepaper 非 0 退出", proc.returncode != 0, "rc=%s" % proc.returncode)
+        check("M3 失败原因为 KeyError('thepaper')",
+              "KeyError" in err and "thepaper" in err, err[-300:])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
-def test_m4_ghost_entry():
-    print("\n[M4] 名录多加 'ghost':50 但无对应站点 -> 闭包 ValueError（名录残留死人）")
-    s = load_real_site_caps()
-    reg = dict(s.SITE_ROUND_CAPS)
-    reg["ghost"] = 50
-    raised = False
-    msg = ""
+def test_m4_yaml_cross_ghost():
+    print("\n[M4] 名录 vs sites.yaml：加 'ghost':50 -> 锁必须变红（真读 yaml）")
+    work = tempfile.mkdtemp(prefix="site_caps_m4_")
     try:
-        closure_check(reg)
-    except ValueError as e:
-        raised, msg = True, str(e)
-    check("M4 闭包检查 raise ValueError", raised, "未 raise")
-    check("M4 文案指向「名录残留死人」", "残留" in msg, msg)
-
-
-def test_m5_wiring_ast():
-    print("\n[M5] 站点生效值真的取自名录（AST 接线锁）")
-    s = load_real_site_caps()
-    for key, (relpath, cname) in SITE_FILES.items():
-        path = os.path.join(ROOT, relpath)
-        src = read_text(path)
-        check("%s 已 import SITE_ROUND_CAPS" % key, _imports_site_round_caps(src), relpath)
-        check("%s 源码引用名录键 '%s'" % (key, key), _references_key(src, key), relpath)
-        if cname is not None:
-            check("%s 的 %s 取自 SITE_ROUND_CAPS['%s']" % (key, cname, key),
-                  _named_binding_is_lookup(src, cname, key), relpath)
-        # 生效值 == 名录值（用真实名录解析）
-        check("%s 名录值 == %d" % (key, EXPECTED_CAPS[key]),
-              s.SITE_ROUND_CAPS.get(key) == EXPECTED_CAPS[key],
-              s.SITE_ROUND_CAPS.get(key))
-
-    # 变异：把 thepaper 的命名常量改回裸字面量 -> 接线锁必须判定为 False
-    tp = read_text(os.path.join(ROOT, SITE_FILES["thepaper"][0]))
-    old = 'MAX_RESULTS = SITE_ROUND_CAPS["thepaper"]'
-    check("M5 变异靶点存在", old in tp, "未找到 %s" % old)
-    mutated = tp.replace(old, "MAX_RESULTS = 9999", 1)
-    check("M5 变异文本确已改变", mutated != tp)
-    check("M5 裸字面量化后被接线锁判定为 False",
-          _named_binding_is_lookup(mutated, "MAX_RESULTS", "thepaper") is False)
+        copy_min_tree(work)
+        scpath = os.path.join(work, "app", "services", "collection", "site_caps.py")
+        src = read_text(scpath)
+        m1 = src.replace('    "thepaper": 100,',
+                         '    "thepaper": 100,\n    "ghost": 50,', 1)
+        check("M4 加 ghost 靶点生效", m1 != src)
+        # 同步抬高棘轮基线，让 import 期 G2 不 raise，从而只让「yaml 交叉锁」变红
+        m2 = m1.replace("ACKNOWLEDGED_WORST_CASE_DAILY = 920",
+                        "ACKNOWLEDGED_WORST_CASE_DAILY = 1020", 1)
+        check("M4 抬高棘轮基线生效", m2 != m1)
+        write_text(scpath, m2)
+        rc, out = run_lock_in_subprocess(work)
+        check("M4 加 ghost 后锁变红", rc != 0, "rc=%s" % rc)
+        check("M4 失败文案点名 ghost/enabled/残留",
+              any(t in out for t in ("ghost", "enabled", "残留")),
+              out.strip().splitlines()[-3:])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def test_m6_harmless_control():
@@ -319,7 +565,6 @@ def test_m6_harmless_control():
     old, new = "ROUNDS_PER_DAY = 2", "ROUNDS_PER_DAY = 2  # 注释变异"
     check("M6 变异靶点存在且唯一", src.count(old) == 1, "count=%d" % src.count(old))
     mutated = src.replace(old, new, 1)
-    check("M6 文本确已改变", mutated != src)
     rc, err = run_site_caps_import_in_subprocess(mutated)
     check("M6 无害变异仍导入成功（rc==0）", rc == 0, "rc=%s stderr=%s" % (rc, err[-300:]))
 
@@ -328,48 +573,47 @@ def test_m7_rounds_anchor():
     print("\n[M7] 轮次假设锚到调度源（run_daily_task.sh 头部 cron 行数）")
     s = load_real_site_caps()
     sh = read_text(RUN_DAILY_SH)
-    n = cron_line_count(sh)
-    check("真实 run_daily_task.sh 头部有 2 条 cron 行", n == 2, "n=%d" % n)
+    check("真实 run_daily_task.sh 头部有 2 条 cron 行", cron_line_count(sh) == 2,
+          "n=%d" % cron_line_count(sh))
     check("真实 ROUNDS_PER_DAY == 2", s.ROUNDS_PER_DAY == 2, s.ROUNDS_PER_DAY)
     check("真实：cron 行数 == ROUNDS_PER_DAY", rounds_consistency_ok(sh, s.ROUNDS_PER_DAY))
-
-    # 只改一处 -> FAIL
-    check("M7a 只把 ROUNDS_PER_DAY 改 1 -> 不一致(FAIL)",
-          rounds_consistency_ok(sh, 1) is False)
-    # 删掉一条 cron 行（源码变异）-> 与 2 不一致 FAIL
+    check("M7a 只把 ROUNDS_PER_DAY 改 1 -> 不一致(FAIL)", rounds_consistency_ok(sh, 1) is False)
     lines = sh.splitlines()
-    kept = []
-    dropped = False
+    kept, dropped = [], False
     for ln in lines:
         if not dropped and "run_daily_task.sh" in ln and ln.strip().startswith("#"):
             dropped = True
             continue
         kept.append(ln)
     sh_one = "\n".join(kept)
-    check("M7b 删一条 cron 行后 cron 计数 == 1", cron_line_count(sh_one) == 1,
-          cron_line_count(sh_one))
+    check("M7b 删一条 cron 行后计数 == 1", cron_line_count(sh_one) == 1, cron_line_count(sh_one))
     check("M7b 源码减一行、ROUNDS_PER_DAY 仍 2 -> 不一致(FAIL)",
           rounds_consistency_ok(sh_one, 2) is False)
-    # 两处一致改 -> PASS（证明该断言真的读了 cron 源，而非只比常量）
-    check("M7c 两处一致改（都 1）-> 一致(PASS)",
-          rounds_consistency_ok(sh_one, 1) is True)
+    check("M7c 两处一致改（都 1）-> 一致(PASS)", rounds_consistency_ok(sh_one, 1) is True)
 
 
 def main():
     print("=" * 66)
-    print("站点单轮上限名录 + 容量守卫回归测试")
+    print("站点单轮上限名录 + 容量守卫回归测试  [mode=%s]" %
+          ("LOCK-ONLY" if LOCK_ONLY else ("CHILD" if IS_CHILD else "FULL")))
     print("=" * 66)
 
-    test_real_values()
-    test_closure_real()
-    test_control_import_ok()
-    test_m1_thepaper_9999()
-    test_m2_people_daily_99999()
-    test_m3_missing_entry()
-    test_m4_ghost_entry()
-    test_m5_wiring_ast()
-    test_m6_harmless_control()
-    test_m7_rounds_anchor()
+    if LOCK_ONLY:
+        test_registry_lock()
+        test_m5_usage_lock()
+    else:
+        test_real_values()
+        test_registry_lock()          # 闭包 + yaml 交叉
+        test_control_import_ok()
+        test_m1_thepaper_9999()
+        test_m2_people_daily_99999()
+        test_m3_production_keyerror()
+        test_m4_yaml_cross_ghost()
+        test_m5_usage_lock()
+        if not IS_CHILD:
+            test_m5_mutation_selfproof()
+        test_m6_harmless_control()
+        test_m7_rounds_anchor()
 
     print("\n" + "=" * 66)
     print("结果: %d 通过 / %d 失败" % (len(PASSED), len(FAILED)))
