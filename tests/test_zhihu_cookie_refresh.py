@@ -711,7 +711,10 @@ def test_refresh_write_decision():
           wrote_dry is False and open(cfg, "rb").read() == dry_before, "")
     check("[14] dry_run 后回读仍是原值", cookie_store.read_cookie_auth(cfg) == changed, "")
 
-    # 写后复验必须真的会拦：打桩让回读撒谎 → 必须抛
+    # 内层守卫：write_cookie_auth 自己的回读校验（打桩让回读撒谎 → 必须抛）。
+    # ⚠️ 这条拦下来的是**内层** write_cookie_auth 的守卫，不是 apply_refreshed_cookie 的：
+    #    内层先抛，外层那行 `if readback != cookie_str` 根本走不到。所以它**不能**用来证明
+    #    外层复验存在 —— 把外层复验删掉（变异 M8）这条依然全绿。外层的独立覆盖见下一段。
     real_read = cookie_store.read_cookie_auth
     raised = False
     cookie_store.read_cookie_auth = lambda _p: "TAMPERED"
@@ -720,11 +723,32 @@ def test_refresh_write_decision():
     except cookie_store.CookieWriteVerificationError:
         raised = True
     except Exception as e:
-        check("[14] 写后复验不一致 → 抛 CookieWriteVerificationError", False,
+        check("[14] 内层回读校验不一致 → 抛 CookieWriteVerificationError", False,
               "实际抛出 %s: %s" % (type(e).__name__, e))
     finally:
         cookie_store.read_cookie_auth = real_read
-    check("[14] 写后复验不一致 → 抛（复验真的会拦，不是装饰）", raised, "未抛出（守卫失效）")
+    check("[14] 内层回读校验不一致 → 抛（内层守卫真的会拦，不是装饰）", raised, "未抛出（守卫失效）")
+
+    # 外层复验：apply_refreshed_cookie 自己那行 `if readback != cookie_str` 必须真的会拦。
+    # 关键是先把**内层** write_cookie_auth 的复验绕开（否则又是内层先抛），办法是把
+    # `_write_back` 打桩成"什么都不写"：于是磁盘仍是旧值 ≠ 传入值，只有外层能拦。
+    outer_target = "outer|guard==check"
+    real_write_back = tool._write_back
+    outer_raised = False
+    tool._write_back = lambda _cfg, _cookie: None
+    try:
+        tool.apply_refreshed_cookie(cfg, outer_target)
+    except cookie_store.CookieWriteVerificationError:
+        outer_raised = True
+    except Exception as e:
+        check("[14] 外层复验不一致 → 抛 CookieWriteVerificationError", False,
+              "实际抛出 %s: %s" % (type(e).__name__, e))
+    finally:
+        tool._write_back = real_write_back
+    check("[14] 场景自证：内层被绕开后磁盘值确实 != 传入值（外层才有机会拦）",
+          cookie_store.read_cookie_auth(cfg) != outer_target, "")
+    check("[14] 外层复验不一致 → 抛（绕开内层后外层仍会拦，不是装饰）", outer_raised,
+          "未抛出（外层复验是装饰 → 变异 M8 会存活）")
 
 
 # ---------------------------------------------------------------------------
