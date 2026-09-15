@@ -2099,6 +2099,40 @@ def test_alert_delivery_is_durable():
     check("[27] G4 补投那次运行日志里出现『未送达』标记（运维可见）",
           marker in blob3, blob3[-500:])
 
+    # ===== 向后兼容：生产机上**已经存在**的旧格式状态文件 =====
+    # 8947a3a 写的状态记录只有 status/ts/code/detail，没有 alert_pending。升级后第一次运行
+    # 必须① 不因为缺字段而崩；② 把「缺失」当成「无未送达告警」（旧实现确实尝试过投递，
+    # 但磁盘上没有记录，无法断定它失败了）⇒ 既不漏掉一次正常的 ok→非ok 告警，
+    # 也不会对「同样的旧状态」反复重放告警。
+    tmp4 = _workdir()
+    legacy = json.dumps({"status": "ok", "ts": "2026-09-01 06:00:00",
+                         "code": 200, "detail": ""}, ensure_ascii=False)
+
+    cfg4, state4 = _cfg_and_state(tmp4, "legacy_ok.yaml")
+    _write_text(state4, legacy)
+    n4 = _Recorder()
+    rc_l, crash_l = _check_catching(config_path=cfg4, state_path=state4,
+                                    fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=n4)
+    check("[27] 向后兼容：旧格式状态文件（只有 status/ts/code/detail）不崩且照常判定 rc==2",
+          crash_l is None and rc_l == 2, "rc=%r crash=%s" % (rc_l, crash_l))
+    check("[27] 向后兼容：旧 ok 历史 → ok→auth_failed 仍然告警**恰好 1 次**（不漏告警）",
+          len(n4.messages) == 1, "n=%d" % len(n4.messages))
+    check("[27] 向后兼容：本次判定已按新 schema 落盘（status=auth_failed 且 pending 已清）",
+          _state_field(state4, "status")[0] == "auth_failed"
+          and _state_field(state4, "alert_pending")[0] is False,
+          "status=%r pending=%r" % (_state_field(state4, "status")[0],
+                                    _state_field(state4, "alert_pending")[0]))
+
+    cfg5, state5 = _cfg_and_state(tmp4, "legacy_failed.yaml")
+    _write_text(state5, json.dumps({"status": "auth_failed", "ts": "2026-09-01 06:00:00",
+                                    "code": 100, "detail": "旧记录"}, ensure_ascii=False))
+    n5 = _Recorder()
+    rc_l5, crash_l5 = _check_catching(config_path=cfg5, state_path=state5,
+                                      fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=n5)
+    check("[27] 向后兼容：旧 auth_failed 记录 → 同类别不重放告警（缺 alert_pending 不等于欠债）",
+          crash_l5 is None and rc_l5 == 2 and n5.messages == [],
+          "rc=%r n=%d crash=%s" % (rc_l5, len(n5.messages), crash_l5))
+
 
 def main():
     print("=" * 70)
