@@ -836,7 +836,7 @@ def run_browser_flow(config_path, headless, timeout_s, settle_ms, dry_run, manua
     if not cookie_str:
         # ⚠️ 这条分支**刻意**与 do_refresh 的同名分支分叉，不要在重构时「顺手统一」：
         # · --login 是**交互路径**：人就在现场准备扫码，再推一条「请扫码」的企微告警纯属噪声，
-        #   而且会把「一次正常的人工登录」变成一次假告警（tests [15] 与 [31-L9] 故意锁住了
+        #   而且会把「一次正常的人工登录」变成一次假告警（tests [15] 与 [32-L9] 故意锁住了
         #   「不误发通知、也不为它跑 check」）；
         # · --refresh 走 cron **无人值守**，同一个条件（profile 里没有有效 z_c0）意味着
         #   cookie 真的过期 ⇒ 必须响铃，所以那边会调 _probe_after_renewal_failure（见 do_refresh）。
