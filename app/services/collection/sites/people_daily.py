@@ -94,7 +94,7 @@ class PeopleDailySite(BaseSite):
     async def _collect_via_homepage(self, session) -> List[Dict[str, Any]]:
         """RSS 失效时的降级路径：爬人民网首页当年文章链接（与 xinhua 首页采集同模式）。
         
-        只认 `/n1/<当年>/MM/DD/` 形态的文章链接，旧专题/旧文章一律排除。
+        只认 `/n1/<当年>/MMDD/`（月日合并一段，如 /n1/2026/0914/）形态的文章链接，旧专题/旧文章一律排除。
         任何失败返回空列表（不伪造），由 pipeline 的站点级缺口告警兜底。
         """
         from bs4 import BeautifulSoup

@@ -85,7 +85,7 @@ class CctvSite(BaseSite):
             # 预筛上限 200（非容量上界——终截断由 unique_data[:_MAX] 把守）：
             # 央视首页 .shtml 链接中栏目入口/专题入口占大头，预筛 50 时
             # 过滤后仅剩个位数真新闻（2026-09 实测 6 条）
-            for i, item in enumerate(news_items[:200]):  # 限制最多200条
+            for item in news_items[:200]:  # 限制最多200条
                 try:
                     # 提取标题
                     title = item.get_text().strip()

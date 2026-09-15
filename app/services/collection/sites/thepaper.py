@@ -31,7 +31,11 @@ MAX_RESULTS = SITE_ROUND_CAPS["thepaper"]
 
 class ThepaperSite(BaseSite):
     """澎湃新闻热点采集"""
-    
+
+    # 澎湃首页右侧「热榜」的官方数据接口（返回 JSON，data.hotNews 为真实热榜 20 条，
+    # 含 praiseTimes/interactionNum/publishTime）。
+    HOT_RANK_API = "https://cache.thepaper.cn/contentapi/wwwIndex/rightSidebar"
+
     def __init__(self, site_code: str = "thepaper", config: Dict[str, Any] = None):
         super().__init__(site_code, config)
         self.site_code = site_code or "thepaper"
@@ -166,11 +170,7 @@ class ThepaperSite(BaseSite):
         #    返回前都做了这层包装，thepaper 此前**漏了它** → 采集到 100 条却「入库 0 条」
         #    （被静默丢弃，无任何日志）。顺序：先按 MAX_RESULTS 截断，再逐条包装（幂等）。
         return [{"fields": item} for item in results[:MAX_RESULTS]]
-    
-    # 澎湃首页右侧「热榜」的官方数据接口（返回 JSON，data.hotNews 为真实热榜 20 条，
-    # 含 praiseTimes/interactionNum/publishTime）。
-    HOT_RANK_API = "https://cache.thepaper.cn/contentapi/wwwIndex/rightSidebar"
-    
+
     async def _fetch_hot_ranking_via_api(self, session) -> List[Dict[str, Any]]:
         """通过官方热榜 API 获取澎湃真实热榜（首选热榜来源）。
         
