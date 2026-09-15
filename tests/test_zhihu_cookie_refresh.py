@@ -792,10 +792,48 @@ def test_dry_run():
     check("[11] dry-run 不写状态文件", not os.path.exists(state), state)
     check("[11] dry-run 不发通知", recorder.messages == [], "n=%d" % len(recorder.messages))
 
-    rc2 = tool.do_refresh(config_path=cfg, dry_run=True)
-    check("[11] --refresh --dry-run 在无 playwright 环境干净退出 rc==3", rc2 == 3, "rc=%r" % (rc2,))
-    rc3 = tool.do_login(config_path=cfg, dry_run=True)
-    check("[11] --login --dry-run 在无 playwright 环境干净退出 rc==3", rc3 == 3, "rc=%r" % (rc3,))
+    # ⚠️ [31] 之后这两格必须改：无 playwright 时浏览器失败分支**不再短路成 rc=3**，而是就地跑
+    # 一次 check()（这就是本次要修的缺陷）。于是：
+    #   · 必须**确定性地**让「取 cookie」抛 ImportError，而不是赌本机没装 playwright
+    #     —— 装了 playwright 的解释器（本机系统 Python 3.13.5）会真起浏览器 + 真外呼，
+    #     rc 还会随线上凭据状态漂移（本仓既有做法见 [27]：用 sys.modules[None] 强制 ImportError）；
+    #   · 必须注入 fetcher/notifier，否则兜底 check 走 default_fetcher = 一次真的外呼知乎
+    #     （本套件声明无外网，见 [22] 的零外呼计数）。
+    # 注入死凭证：兜底 check 判成认证失败 ⇒ rc==2（要人工扫码），dry-run 仍不落盘 / 不通知。
+    real_browser = tool._browser_cookie_string
+    rec_br = _Recorder()
+    state_br = os.path.join(tmp, "browser_fail_dry.json")
+    rc2, crash_br = None, None
+    try:
+        tool._browser_cookie_string = _browser_that_raises(ImportError)
+        rc2 = tool.do_refresh(config_path=cfg, dry_run=True, state_path=state_br,
+                              fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=rec_br)
+    except Exception as e:  # noqa: BLE001
+        crash_br = "%s: %s" % (type(e).__name__, e)
+    finally:
+        tool._browser_cookie_string = real_browser
+    check("[11] --refresh --dry-run 且浏览器不可用 → 不崩、仍跑 check，死凭证 rc==2",
+          crash_br is None and rc2 == 2, "rc=%r crash=%s" % (rc2, crash_br))
+    check("[11] --refresh --dry-run 的浏览器失败分支仍不写状态文件",
+          not os.path.exists(state_br), state_br)
+    check("[11] --refresh --dry-run 的浏览器失败分支仍不发通知", rec_br.messages == [],
+          "n=%d" % len(rec_br.messages))
+
+    # 健康凭证一侧：兜底 check 判成 ok ⇒ 续期确实没做成 ⇒ rc==3，且同样不通知。
+    rec_br2 = _Recorder()
+    rc3, crash_br2 = None, None
+    try:
+        tool._browser_cookie_string = _browser_that_raises(ImportError)
+        rc3 = tool.do_login(config_path=cfg, dry_run=True, state_path=state_br,
+                            fetcher=_FakeFetcher(200, _ok_body()), notifier=rec_br2)
+    except Exception as e:  # noqa: BLE001
+        crash_br2 = "%s: %s" % (type(e).__name__, e)
+    finally:
+        tool._browser_cookie_string = real_browser
+    check("[11] --login --dry-run 且浏览器不可用但凭证健康 → 不崩、rc==3",
+          crash_br2 is None and rc3 == 3, "rc=%r crash=%s" % (rc3, crash_br2))
+    check("[11] --login --dry-run 的浏览器失败分支不发通知", rec_br2.messages == [],
+          "n=%d" % len(rec_br2.messages))
     check("[11] 无 playwright 时未创建 runtime/ profile 目录",
           not os.path.exists(os.path.join(ROOT, "runtime", "zhihu_profile")), "")
 
@@ -1446,6 +1484,146 @@ def test_tool_wiring_locks():
           crash3 is None and rc3 == 3, "rc=%r crash=%s" % (rc3, crash3))
     _assert_state("[20] D4 tool:507 此时就地校验确实通过了（状态文件被写成 ok）",
                   state3, "status", "ok")
+
+
+# ---------------------------------------------------------------------------
+# [31] 浏览器/运行环境不可用 → **仍必须跑 check**（认证告警不许被浏览器故障掩盖）
+# ---------------------------------------------------------------------------
+def _browser_that_raises(exc):
+    """返回一个「取 cookie 必将抛 exc」的替身。
+
+    刻意抛**真的** ImportError/RuntimeError，而不是返回 `(None, "...")`：
+    本组要锁的正是 `_browser_cookie_string` 的 **except 分支**。「返回 (None, ...)」走的是
+    `if not cookie_str: return EXIT_AUTH` 那条**早已被 [15] 覆盖**的路径，与本次缺陷无关。
+    传异常**类型**时每次调用新建实例（避免复用同一个 traceback 对象）。
+    """
+    def _raise(headless, timeout_s, settle_ms):
+        if isinstance(exc, type):
+            raise exc("模拟浏览器/运行环境不可用")
+        raise exc
+    return _raise
+
+
+def test_browser_failure_still_runs_check():
+    """[31] 浏览器抛错时 do_refresh / do_login（run_browser_flow）都不许短路掉 check。
+
+    缺陷形态：两个分支直接 `return EXIT_ERROR` ⇒ 不探测凭证、不写状态文件、不发告警，
+    只剩一行日志；cron 里 MAILTO="" 且只写日志文件 ⇒ 续期天天静默 rc=3，cookie 同时悄悄
+    过期、zhihu 静默 0 条。
+
+    L4（用法点锁）的写法**刻意不 spy tool.check**：把锁 spy 在上游函数上，会让「真正的
+    副作用从未被执行」也全绿（本仓历史教训：把 _write_back 改成 pass，套件仍 297/0）。
+    这里用**注入的 fetcher 的调用计数** + 落盘的状态文件来证明 check 真的被跑到 —— 上游被
+    短路时它们必然为 0/不存在。
+    """
+    print("\n[31] 浏览器不可用 → 仍跑 check（L1 死凭证必告警 / L2 健康凭证不误报 / "
+          "L3 通用 Exception / L4 用法点计数）")
+
+    # --- L1 / L3a：浏览器抛错 + 凭证 401 → rc==2，且告警必须被**尝试投递**、状态必须落盘 ---
+    for label, exc in (("L1", ImportError), ("L3a", RuntimeError)):
+        tmp = _workdir()
+        cfg, state = _cfg_and_state(tmp, "browserfail_%s.yaml" % label)
+        rec = _Recorder()
+        fetch = _FakeFetcher(401, BODY_CODE_100)
+        real_browser = tool._browser_cookie_string
+        try:
+            tool._browser_cookie_string = _browser_that_raises(exc)
+            rc, crash = _call_catching(tool.do_refresh, config_path=cfg, state_path=state,
+                                       fetcher=fetch, notifier=rec)
+        finally:
+            tool._browser_cookie_string = real_browser
+        check("[31-%s] 浏览器抛 %s 且凭证 401 → 不崩、rc==2（认证失效要人工扫码）"
+              % (label, exc.__name__), crash is None and rc == 2,
+              "rc=%r crash=%s" % (rc, crash))
+        # L4：check 真被到达的**行为证据** —— 注入的 fetcher 恰好被消费 1 次。
+        check("[31-%s] L4 注入的 fetcher 恰好被调用 1 次（check 真被执行，不是被 spy 掉）"
+              % label, fetch.calls == 1, "calls=%d" % fetch.calls)
+        check("[31-%s] 告警被**尝试投递**（注入的 notifier 恰好收到 1 条）" % label,
+              len(rec.messages) == 1, "n=%d" % len(rec.messages))
+        if rec.messages:
+            check("[31-%s] 告警文案含 code=100 与人工动作 --login" % label,
+                  "code=100" in rec.messages[0] and "--login" in rec.messages[0],
+                  rec.messages[0])
+            check("[31-%s] 告警不含 cookie 明文" % label,
+                  "DUMMY_COOKIE" not in rec.messages[0] and "z_c0=" not in rec.messages[0],
+                  rec.messages[0])
+        _assert_state("[31-%s] 状态文件被写出且记下这次认证失败（status=auth_failed）" % label,
+                      state, "status", "auth_failed")
+        _assert_state("[31-%s] 状态文件记的 code 是接口 code=100" % label, state, "code", 100)
+
+    # --- L2 / L3b：浏览器抛错但凭证健康（200 + 非空 data）→ rc==3，且**不许**告警 ---
+    for label, exc in (("L2", ImportError), ("L3b", RuntimeError)):
+        tmp = _workdir()
+        cfg, state = _cfg_and_state(tmp, "browserok_%s.yaml" % label)
+        rec = _Recorder()
+        fetch = _FakeFetcher(200, _ok_body())
+        real_browser = tool._browser_cookie_string
+        try:
+            tool._browser_cookie_string = _browser_that_raises(exc)
+            rc, crash = _call_catching(tool.do_refresh, config_path=cfg, state_path=state,
+                                       fetcher=fetch, notifier=rec)
+        finally:
+            tool._browser_cookie_string = real_browser
+        check("[31-%s] 浏览器抛 %s 但凭证健康 → 不崩、rc==3（续期没做成，但不是认证问题）"
+              % (label, exc.__name__), crash is None and rc == 3,
+              "rc=%r crash=%s" % (rc, crash))
+        check("[31-%s] L4 注入的 fetcher 恰好被调用 1 次（check 真被执行）" % label,
+              fetch.calls == 1, "calls=%d" % fetch.calls)
+        check("[31-%s] 凭证健康时**不误发**告警（notifier 收到 0 条）" % label,
+              rec.messages == [], "n=%d" % len(rec.messages))
+        _assert_state("[31-%s] 兜底 check 确实落了状态文件（status=ok）" % label,
+                      state, "status", "ok")
+
+    # --- L4b：另一个消费点 run_browser_flow（--login 走它）必须同样跑 check ---
+    # 只改 do_refresh 而漏改 run_browser_flow 是这条缺陷最容易复发的半修形态，
+    # 所以两条路径各用「死凭证 / 健康凭证」两格把结论钉一遍。
+    for label, status, body, want_rc, want_alerts in (
+            ("L4b-死凭证", 401, BODY_CODE_100, 2, 1),
+            ("L4b-健康凭证", 200, _ok_body(), 3, 0)):
+        tmp = _workdir()
+        cfg, state = _cfg_and_state(tmp, "login_%s.yaml" % label)
+        rec = _Recorder()
+        fetch = _FakeFetcher(status, body)
+        real_browser = tool._browser_cookie_string
+        try:
+            tool._browser_cookie_string = _browser_that_raises(ImportError)
+            rc, crash = _call_catching(tool.do_login, config_path=cfg, state_path=state,
+                                       fetcher=fetch, notifier=rec)
+        finally:
+            tool._browser_cookie_string = real_browser
+        check("[31-%s] --login 的浏览器抛 ImportError → 不崩、rc==%d" % (label, want_rc),
+              crash is None and rc == want_rc, "rc=%r crash=%s（期望 %d）" % (rc, crash, want_rc))
+        check("[31-%s] L4 注入的 fetcher 恰好被调用 1 次（run_browser_flow 也真跑了 check）"
+              % label, fetch.calls == 1, "calls=%d" % fetch.calls)
+        check("[31-%s] 注入的 notifier 收到 %d 条告警" % (label, want_alerts),
+              len(rec.messages) == want_alerts, "n=%d" % len(rec.messages))
+        _assert_state("[31-%s] run_browser_flow 分支也落了状态文件" % label,
+                      state, "status", "auth_failed" if want_rc == 2 else "ok")
+
+    # --- L5：兜底 check **自身**抛异常也必须被兜住 ⇒ rc 只允许落在 {0,2,3} ---
+    # 需求里明确要求「绝不能因为这里抛异常而变成 rc=1 + traceback」：rc=1 是比 rc=3 更糟的
+    # 失效形态（既没落状态文件、也没发告警，还只在日志里留个栈）。这里用 read_cookie_auth
+    # 抛一个**非 CookieConfigError** 的异常来构造「异常会从 check() 逃出来」的路径
+    # （check() 内部只接 CookieAuthMissing/CookieConfig，别的类型会穿出去）。
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "boom_check.yaml")
+    real_browser = tool._browser_cookie_string
+    real_read = cookie_store.read_cookie_auth
+
+    def _boom_read(_path):
+        raise ValueError("模拟 check 自身抛出的非预期异常")
+
+    try:
+        tool._browser_cookie_string = _browser_that_raises(ImportError)
+        cookie_store.read_cookie_auth = _boom_read
+        rc, crash = _call_catching(tool.do_refresh, config_path=cfg, state_path=state,
+                                   fetcher=_FakeFetcher(401, BODY_CODE_100),
+                                   notifier=_Recorder())
+    finally:
+        cookie_store.read_cookie_auth = real_read
+        tool._browser_cookie_string = real_browser
+    check("[31-L5] 兜底 check 自身抛异常 → 不崩（无 traceback 逃出）、rc==3",
+          crash is None and rc == 3, "rc=%r crash=%s" % (rc, crash))
 
 
 # ---------------------------------------------------------------------------
@@ -2520,6 +2698,7 @@ def main():
     test_401_without_code()
     test_state_path_blocked_by_file()
     test_tool_wiring_locks()
+    test_browser_failure_still_runs_check()
     test_fake_notifier_is_the_one_used()
     test_no_network_egress()
     test_corrupt_state_file_is_visible()

@@ -21,8 +21,20 @@
   2 = 认证失败      401（code 101/100）**或** `cookie.auth` 缺失/为空
   3 = 其它一切      传输失败 / 响应体无法解析 / **任何其它非 200 状态（403/429/500/302…）**
                     / 状态文件不可用（父路径被普通文件占位、权限不足…）
+                    / **浏览器或运行环境不可用**（playwright 缺失、chromium 未安装或装坏、
+                      驱动启动失败……即 --login/--refresh 根本拿不到 cookie 的那类故障）
 仅**类别变化**时告警：ok→非ok 一定响铃（含 403/429 风控——它意味着采集已被静默阻断），
 →ok 发恢复通知，同一类别反复出现不重复告警。
+
+⚠️ rc=3 里的「浏览器/运行环境不可用」有一条**刻意的例外**：--login / --refresh 遇到这种
+故障时**不会**直接返回 3 了事，而是**仍然就地跑一次 check()**（探测凭证 → 需要时告警 →
+落状态文件），只有 check() 判定凭证失效才返回 2（要人工扫码），否则才返回 3。
+理由：若浏览器故障直接短路成 rc=3，就同时短路掉了认证探测、告警与状态落盘 —— cron 里
+MAILTO="" 且只写日志文件，于是「续期每天静默 rc=3」与「cookie 悄悄过期、zhihu 静默 0 条」
+会同时发生而无人察觉。这正是 weibo 站点已经真实发生过的静默降级
+（`BrowserType.launch: Executable doesn't exist at .../chrome-headless-shell`，被裸 print
+吞掉数月无人发现）；本工具的存在意义就是让这类故障响铃，绝不能自己犯同一个病。
+见 _check_after_browser_failure()。
 
 告警投递是**持久化义务**（本工具的立身之本就是「出事会响」）
 -----------------------------------------------------------------------------
@@ -754,6 +766,44 @@ def apply_refreshed_cookie(config_path, cookie_str, dry_run=False):
     return True
 
 
+def _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run):
+    """浏览器不可用时的**兜底校验**：rc 契约不变，但告警义务一条都不许丢。
+
+    --login / --refresh 只要浏览器拿不到 cookie（playwright 不可导入 / chromium 装坏 /
+    驱动启动失败）就走这里。从前这两个失败分支直接 `return EXIT_ERROR` —— 于是「浏览器坏了」
+    同时意味着「不做认证探测、不写状态文件、不发告警」，只剩一行日志。而本工具的 cron 调用点
+    `MAILTO=""` 且只写日志文件 ⇒ 续期每天静默 rc=3 的同时，cookie 在同一时间悄悄过期、
+    zhihu 静默 0 条入库，几个月没人发现。这等于把 weibo 站点已经真实发生过的静默降级
+    （`BrowserType.launch: Executable doesn't exist at .../chrome-headless-shell`，被裸 print
+    吞掉）移植进了「为消灭静默失败而造」的这个工具里。
+
+    所以浏览器失败也要用**完全相同的** config/state/fetcher/notifier/dry_run 跑一次 check()，
+    借它的副作用去探测凭证、在凭证不可用时把告警发出去、并把状态落盘，然后：
+
+      · check() == EXIT_AUTH → 凭证确实失效，告警已经发出 ⇒ 返回 EXIT_AUTH（要人工扫码）；
+      · 否则（包括 check() 判成 ok 的情形）→ 续期确实没做成 ⇒ 返回 EXIT_ERROR。
+        「凭证仍可用就不告警」是刻意的：浏览器故障本身不需要人扫码，把它做成每次都响的
+        误报机器，运维很快就会把本工具的告警当成噪声。
+
+    check() 自身抛异常也兜住：rc 永远只落在 {0,2,3}，绝不因为这里变成 rc=1 + traceback ——
+    那个 rc 既没落状态文件也没发告警，是比 rc=3 更糟的失效形态。
+    """
+    try:
+        result = check(config_path=config_path, state_path=state_path, fetcher=fetcher,
+                       notifier=notifier, dry_run=dry_run)
+    except Exception as e:
+        LOG.error("浏览器不可用后的兜底 check 抛出未预期异常（%s: %s）；本次按 rc=%d 处理",
+                  type(e).__name__, e, EXIT_ERROR)
+        return EXIT_ERROR
+    if result == EXIT_AUTH:
+        LOG.error("浏览器不可用，且兜底 check 判定凭证失效（rc=%d）：告警已发出，"
+                  "需要人工执行 --login 扫码登录", EXIT_AUTH)
+        return EXIT_AUTH
+    LOG.error("浏览器不可用，但兜底 check 未判定凭证失效（check rc=%s）；续期未完成，"
+              "本次按 rc=%d 处理", result, EXIT_ERROR)
+    return EXIT_ERROR
+
+
 def run_browser_flow(config_path, headless, timeout_s, settle_ms, dry_run, manual_hint,
                      state_path=None, fetcher=None, notifier=None):
     """--login / --refresh 的公共流程。返回退出码。"""
@@ -762,10 +812,11 @@ def run_browser_flow(config_path, headless, timeout_s, settle_ms, dry_run, manua
     except ImportError as e:
         LOG.error("playwright 不可导入（%s）。--login/--refresh 需要 playwright + chromium；"
                   "--check 不需要浏览器。", e)
-        return EXIT_ERROR
+        # 浏览器不可用 ≠ 可以跳过认证探测：凭证若已失效，告警必须发出去（见函数 docstring）
+        return _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run)
     except Exception as e:
         LOG.error("启动/驱动浏览器失败：%s: %s", type(e).__name__, e)
-        return EXIT_ERROR
+        return _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run)
 
     if not cookie_str:
         LOG.error("%s。%s", error, manual_hint)
@@ -804,10 +855,11 @@ def do_refresh(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S,
             headless=True, timeout_s=timeout_s, settle_ms=REFRESH_SETTLE_MS)
     except ImportError as e:
         LOG.error("playwright 不可导入（%s）。--refresh 需要 playwright + chromium。", e)
-        return EXIT_ERROR
+        # 浏览器不可用 ≠ 可以跳过认证探测：凭证若已失效，告警必须发出去（见函数 docstring）
+        return _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run)
     except Exception as e:
         LOG.error("启动/驱动浏览器失败：%s: %s", type(e).__name__, e)
-        return EXIT_ERROR
+        return _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run)
 
     if not cookie_str:
         LOG.error("%s。持久化 profile 已失效，需要人工执行 --login 重新扫码登录", error)
@@ -823,6 +875,7 @@ def do_refresh(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S,
         LOG.error("续期写回失败：%s", write_error)
 
     # 无论写回是否成功都要跑 check：凭证若确实不可用，告警必须发出去
+    # （上面两个浏览器失败分支同样适用 —— 见 _check_after_browser_failure）
     result = check(config_path=config_path, state_path=state_path, fetcher=fetcher,
                    notifier=notifier, dry_run=dry_run)
     if write_error and result == EXIT_OK:
