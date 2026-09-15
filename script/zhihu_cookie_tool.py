@@ -15,9 +15,14 @@
   · `--refresh` 无头复用同一 profile 定期续期（cookie 真的变了才写回）
   · `--check`   纯 HTTP 判定可用性 + 仅在**状态变化**时告警（无需浏览器，可在任意机器跑）
 
-退出码
-------
-  0 = 凭证可用     2 = 认证失败（需要人工 --login）     3 = 传输/解析/配置错误
+退出码（运维契约，改这里必须同步改 runbook / script/zhihu_cookie_refresh.sh）
+-----------------------------------------------------------------------------
+  0 = ok           HTTP 200 且响应体解析出**非空** data 列表
+  2 = 认证失败      401（code 101/100）**或** `cookie.auth` 缺失/为空
+  3 = 其它一切      传输失败 / 响应体无法解析 / **任何其它非 200 状态（403/429/500/302…）**
+                    / 状态文件不可用（父路径被普通文件占位、权限不足…）
+仅**类别变化**时告警：ok→非ok 一定响铃（含 403/429 风控——它意味着采集已被静默阻断），
+→ok 发恢复通知，同一类别反复出现不重复告警。
 
 依赖约束
 --------
@@ -69,13 +74,43 @@ EXIT_OK = 0
 EXIT_AUTH = 2
 EXIT_ERROR = 3
 
-EXIT_BY_STATE = {"ok": EXIT_OK, "auth_failed": EXIT_AUTH, "error": EXIT_ERROR}
+# 状态 = **类别名**，直接落进状态文件：
+#   ok          200 + data 为非空列表                → rc 0
+#   auth_failed 401（code 101/100，或 cookie.auth 缺失/为空）→ rc 2
+#   anti_bot    403 / 429（风控拦截，采集被静默阻断）  → rc 3
+#   transport   连不上 / 超时 / TLS                    → rc 3
+#   error       其它非 200（500/302…）、响应体无法解析、状态文件不可用 → rc 3
+# 「类别名」而非粗粒度的 ok/error，是为了让状态机区分 401 认证 / 403·429 风控 / 传输失败：
+# 只有类别**变了**才告警，同一类别反复出现不重复打扰。
+STATE_OK = "ok"
+STATE_AUTH_FAILED = "auth_failed"
+STATE_ANTI_BOT = "anti_bot"
+STATE_TRANSPORT = "transport"
+STATE_ERROR = "error"
+
+ANTI_BOT_STATUSES = (403, 429)
+
+EXIT_BY_STATE = {
+    STATE_OK: EXIT_OK,
+    STATE_AUTH_FAILED: EXIT_AUTH,
+    STATE_ANTI_BOT: EXIT_ERROR,
+    STATE_TRANSPORT: EXIT_ERROR,
+    STATE_ERROR: EXIT_ERROR,
+}
 
 AUTH_LABELS = {101: "无凭证/未识别", 100: "凭证过期"}
 
 
 class TransportError(Exception):
     """传输层失败（连不上、超时、TLS 等），与「认证失败」严格区分。"""
+
+
+class StateWriteError(Exception):
+    """状态文件不可用（父路径被普通文件占位 / 权限不足 / 磁盘错误等）。
+
+    状态文件是「只在状态变化时告警」的判据，写不进去就无法判断本次是否发生变化。
+    按 rc 契约「状态文件不可用 → 3」处理，绝不把 OSError 直抛给调用方。
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +159,12 @@ def default_fetcher(url, cookie, timeout=10):
 def classify(status, body):
     """把 (status, body) 判成 (state, code, detail)。
 
-    state ∈ {"ok", "auth_failed", "error"}；code 为接口 code（无则回落 HTTP status）。
+    state ∈ {"ok", "auth_failed", "anti_bot", "error"}；code 为接口 code（无则回落 HTTP status）。
+
+    ⚠️ 本函数**必须不可崩**：任何人调用它时都不能让 AttributeError 冒出去把 --check/--refresh
+    变成 rc=1「无状态、无告警」。曾经这里写成 `"... %s" % (a, b, c, d).strip()`，
+    `.strip()` 绑在**元组**上而不是格式化结果上，于是任何非 200/401 的状态（403/429/500/302）
+    都会 AttributeError。测试用「403/429/500/302 → rc=3 且不抛异常」把这条钉住。
     """
     payload = None
     parse_error = ""
@@ -145,14 +185,16 @@ def classify(status, body):
 
     if status == 200:
         if isinstance(payload, dict) and isinstance(payload.get("data"), list) and payload["data"]:
-            return "ok", 200, ""
+            return STATE_OK, 200, ""
         if payload is None:
             detail = "HTTP 200 但响应体无法解析为 JSON（%s）" % (parse_error or "空响应体")
         else:
-            detail = "HTTP 200 但 data 不是非空列表（data=%r）" % (payload.get("data"),)
-        return "error", status, detail
+            # 注意：payload 可能是 list/str，直接 .get 会 AttributeError（同一类崩溃路径）
+            data = payload.get("data") if isinstance(payload, dict) else None
+            detail = "HTTP 200 但 data 不是非空列表（data=%r）" % (data,)
+        return STATE_ERROR, status, detail
 
-    if status == 401 or api_code in (100, 101):
+    if status == 401:
         if api_code == 101:
             label = AUTH_LABELS[101]
         elif api_code == 100 or "ERR_LOGIN_TICKET_EXPIRED" in api_message:
@@ -160,10 +202,16 @@ def classify(status, body):
         else:
             label = "认证失败"
         detail = "code=%s %s name=%s message=%s" % (api_code, label, api_name, api_message)
-        return "auth_failed", api_code if api_code is not None else status, detail.strip()
+        return STATE_AUTH_FAILED, api_code if api_code is not None else status, detail.strip()
 
-    return "error", status, "HTTP %s name=%s message=%s %s" % (
-        status, api_name, api_message, parse_error).strip()
+    if status in ANTI_BOT_STATUSES:
+        # 403/429 = 风控/限流：采集同样已经断流，必须响铃（而不是静静地 rc=3）
+        detail = ("HTTP %s 风控拦截（anti-bot）name=%s message=%s %s"
+                  % (status, api_name, api_message, parse_error))
+        return STATE_ANTI_BOT, status, detail.strip()
+
+    detail = "HTTP %s name=%s message=%s %s" % (status, api_name, api_message, parse_error)
+    return STATE_ERROR, status, detail.strip()
 
 
 def top_titles(body, limit=3):
@@ -236,23 +284,42 @@ def resolve_state_path(explicit=None):
 
 
 def _read_state(path):
+    """读取状态文件；**宽容**地把任何读不动的形态当成「无历史」，但绝不静默。
+
+    宽容是刻意的：状态文件只是「是否要告警」的判据，读坏了不应该让采集监控本身挂掉。
+    但降级必须可见 —— 否则一个被写坏的 json 会永久静默掉后续所有告警。
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
+    except FileNotFoundError:
         return {}
+    except Exception as e:
+        LOG.warning("状态文件无法解析（%s）：%s: %s；本次按『无历史』继续（不重复告警判据失效）",
+                    path, type(e).__name__, e)
+        return {}
+    if not isinstance(data, dict):
+        LOG.warning("状态文件顶层不是 JSON 对象（%s，实际类型 %s）；本次按『无历史』继续",
+                    path, type(data).__name__)
+        return {}
+    return data
 
 
 def _write_state(path, record):
-    parent = os.path.dirname(path)
-    if parent and not os.path.isdir(parent):
-        os.makedirs(parent, exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(record, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    os.replace(tmp, path)
+    """原子写状态文件；任何 OS 层失败都收敛成 StateWriteError（→ rc=3）。"""
+    try:
+        parent = os.path.dirname(path)
+        if parent and not os.path.isdir(parent):
+            # ⚠️ exist_ok=True 救不了「父路径被**普通文件**占位」：那种情况仍抛
+            # FileExistsError。这条路径曾经直抛给调用方，把 --check 变成 rc=1。
+            os.makedirs(parent, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(record, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        raise StateWriteError("%s (%s: %s)" % (path, type(e).__name__, e))
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +330,58 @@ def auth_alert_message(code, detail):
             "需要人工执行 python3 script/zhihu_cookie_tool.py --login 扫码登录" % (code, detail))
 
 
+def anti_bot_alert_message(code, detail):
+    return ("[知乎Cookie] 站点=zhihu 状态=风控拦截(anti-bot) code=%s（%s）；"
+            "热榜接口已被风控静默拦截，采集实际已断流：请检查出口 IP / 降低请求频率，"
+            "必要时人工执行 python3 script/zhihu_cookie_tool.py --login" % (code, detail))
+
+
+def transport_alert_message(code, detail):
+    return ("[知乎Cookie] 站点=zhihu 状态=传输失败 code=%s（%s）；"
+            "网络/超时问题，先观察出口连通性，暂不需要人工扫码" % (code, detail))
+
+
+def error_alert_message(code, detail):
+    return ("[知乎Cookie] 站点=zhihu 状态=异常 code=%s（%s）；"
+            "接口返回了非预期状态，请人工确认热榜接口是否变更" % (code, detail))
+
+
+def state_alert_message(state, code, detail):
+    """按**类别**产出告警文案：401 认证 / 403·429 风控 / 传输 / 其它异常各自可区分。
+
+    类别不同 ⇒ 文案不同，运维一眼能看出「该扫一次码」还是「该查出口 IP」。
+    """
+    code = "n/a" if code is None else code
+    if state == STATE_AUTH_FAILED:
+        return auth_alert_message(code, detail)
+    if state == STATE_ANTI_BOT:
+        return anti_bot_alert_message(code, detail)
+    if state == STATE_TRANSPORT:
+        return transport_alert_message(code, detail)
+    return error_alert_message(code, detail)
+
+
 def recovery_alert_message(code):
     return ("[知乎Cookie] 站点=zhihu 状态=已恢复 code=%s；"
             "--refresh 续期成功且校验通过，无需人工介入" % code)
+
+
+def should_alert(previous, state):
+    """状态机：只在**类别变化**时告警。previous 为 "" 表示「无历史」。
+
+    规则（每条都对应一个行为级用例）：
+      · 同一类别重复出现 → 不重复告警；
+      · 无历史时只有 auth_failed 告警（"凭证缺失"这条最确定的生产失效），
+        传输/风控的偶发首现不打扰人；
+      · 曾经 ok、现在任何非 ok → 一定响铃（含 403/429 风控）；
+      · 两个不同的非 ok 类别之间切换 → 响铃；
+      · →ok：previous 非空且不是 ok 时发恢复通知。
+    """
+    if not previous:
+        return state == STATE_AUTH_FAILED
+    if previous == state:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +403,7 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
         # 提示人工 --login；绝不能静默 return。
         LOG.error("凭证缺失：%s", e)
         cookie = ""
-        state, code = "auth_failed", None
+        state, code = STATE_AUTH_FAILED, None
         detail = "无凭证/未识别（%s）" % e
     except cookie_store.CookieConfigError as e:
         # 文件不存在 / 不是合法 YAML / 顶层结构不对：属配置或运维问题，
@@ -297,36 +413,41 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
     else:
         LOG.info("读取 cookie.auth %s（来自 %s）", redact(cookie), config_path)
         try:
+            # ⚠️ classify() 必须在 try **内部**调用：它不是「不可能出错」的纯函数
+            # （D1：一行 `.strip()` 绑错对象就能让任何非 200/401 状态抛 AttributeError）。
+            # 放进 try 体里，分类器出错最多退化成 rc=3，而不是逃出 check() 变成 rc=1
+            # ——那种 rc 既没写状态文件也没发告警，是最糟的失效形态。
             status, body = fetch(DEFAULT_URL, cookie, timeout)
+            state, code, detail = classify(status, body)
         except TransportError as e:
             detail = "传输失败: %s" % e
             LOG.error("请求热榜接口失败（%s）", detail)
-            state, code = "error", 0
+            state, code = STATE_TRANSPORT, 0
         except Exception as e:
             detail = "未预期异常 %s: %s" % (type(e).__name__, e)
             LOG.error("请求热榜接口出现%s", detail)
-            state, code = "error", 0
-        else:
-            state, code, detail = classify(status, body)
+            state, code = STATE_ERROR, 0
 
     LOG.info("状态文件: %s", resolved_state)
     previous = str(_read_state(resolved_state).get("status") or "")
 
     alert = None
-    if state == "ok":
+    if state == STATE_OK:
         LOG.info("HTTP 200 且 data 为非空列表 → 凭证可用")
         for index, title in enumerate(top_titles(body), 1):
             LOG.info("  热榜 #%d %s", index, title)
-        if previous == "auth_failed":
+        if previous and previous != STATE_OK:
             alert = recovery_alert_message(code)
-    elif state == "auth_failed":
-        LOG.error("认证失败：%s", detail)
-        if previous == "auth_failed":
-            LOG.warning("与上次状态相同（auth_failed），不重复告警")
-        else:
-            alert = auth_alert_message(code if code is not None else "n/a", detail)
     else:
-        LOG.warning("无法判定凭证状态：%s", detail)
+        if state == STATE_AUTH_FAILED:
+            LOG.error("认证失败：%s", detail)
+        else:
+            LOG.warning("凭证不可用（state=%s）：%s", state, detail)
+        if should_alert(previous, state):
+            alert = state_alert_message(state, code, detail)
+        else:
+            LOG.warning("上次状态 %r → 本次 %r：不重复告警",
+                        previous or "<无历史>", state)
 
     if alert:
         if dry_run:
@@ -337,12 +458,18 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
     if dry_run:
         LOG.info("[dry-run] 不写状态文件（实际会写 %s）", resolved_state)
     else:
-        _write_state(resolved_state, {
-            "status": state, "ts": _now(), "code": code, "detail": detail,
-        })
+        try:
+            _write_state(resolved_state, {
+                "status": state, "ts": _now(), "code": code, "detail": detail,
+            })
+        except StateWriteError as e:
+            LOG.error("状态文件不可用：%s；本次判定 state=%s 无法记账，按运维错误返回 rc=%d",
+                      e, state, EXIT_ERROR)
+            return EXIT_ERROR
 
-    LOG.info("判定结果 state=%s code=%s rc=%d", state, code, EXIT_BY_STATE[state])
-    return EXIT_BY_STATE[state]
+    rc = EXIT_BY_STATE.get(state, EXIT_ERROR)
+    LOG.info("判定结果 state=%s code=%s rc=%d", state, code, rc)
+    return rc
 
 
 # ---------------------------------------------------------------------------

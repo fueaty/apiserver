@@ -38,7 +38,9 @@ LOG_FILE="$APISERVER_HOME/logs/zhihu_cookie_$(date +%Y%m%d).log"
 # 创建日志目录
 mkdir -p "$APISERVER_HOME/logs"
 
-# 执行续期（rc: 0=成功 / 2=认证仍失败，需人工 --login / 3=传输或配置错误）
+# 执行续期（rc 契约见 zhihu_cookie_tool.py 头部：
+#   0=成功 / 2=认证仍失败（需人工 --login）/ 3=传输失败、任何其它非 200 状态
+#   （403/429 风控、500、302…）、响应体无法解析、状态文件不可用）
 echo "$(date '+%Y-%m-%d %H:%M:%S') - 开始知乎 cookie 续期 (home=${APISERVER_HOME})" >> "$LOG_FILE"
 python3 script/zhihu_cookie_tool.py --refresh >> "$LOG_FILE" 2>&1
 RC=$?
@@ -48,7 +50,7 @@ if [ $RC -eq 0 ]; then
 elif [ $RC -eq 2 ]; then
     echo "$(date '+%Y-%m-%d %H:%M:%S') - 续期失败 (rc=2)：凭证仍不可用，需要人工执行 --login 扫码" >> "$LOG_FILE"
 else
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - 续期异常 (rc=$RC)" >> "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - 续期异常 (rc=$RC)：查日志确认是风控(403/429)/传输/状态文件问题" >> "$LOG_FILE"
 fi
 
 echo "$(date '+%Y-%m-%d %H:%M:%S') - 任务结束" >> "$LOG_FILE"

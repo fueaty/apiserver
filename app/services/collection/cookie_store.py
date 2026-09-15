@@ -16,7 +16,9 @@
   3. 保留文件原有换行约定（LF / CRLF）。本仓库在 Windows 上带 core.autocrlf，
      绝不能让通用换行模式把 CRLF 悄悄改写成 LF —— 故全程以二进制读写 + 逐行保留 EOL。
   4. 写盘后**回读校验**；回读值与写入值不一致必须抛错，绝不静默报成功。
-  5. 幂等：同一值连写两次，文件字节不变。
+  5. 幂等：同一值连写两次，文件字节不变（且**不触发任何原子替换**）。
+  6. 事务性：**每一条拒绝路径**都必须让目标文件逐字节等于调用前 —— 预校验在写盘之前，
+     回读失败则用内存里的原始字节还原后再抛。
 
 副作用约束
 ----------
@@ -178,9 +180,16 @@ def _indent_width(prefix):
 
 
 def _find_auth_key_lines(text_lines, section="cookie"):
-    """定位 `cookie:` 段内**所有**定义 `auth:` 的行号（0 基）。"""
+    """定位 `cookie:` 段内**直接子键**里所有定义 `auth:` 的行号（0 基）。
+
+    ⚠️ 只认直接子键（缩进等于段内**第一个**子键的缩进）。早期实现认「缩进 > 段缩进」
+    的所有行，于是 `cookie: > nested: > auth:` 这种**嵌套**同名键也会命中：那一行会被
+    改写，紧接着回读时 `cookie.auth` 依然缺失 → 抛 CookieAuthMissingError，把「拒绝写入」
+    这条红线变成了「先改再报错」。嵌套键必须视为 **0 条**（拒绝），而不是 1 条。
+    """
     hits = []
     section_indent = None
+    child_indent = None
     for index, raw in enumerate(text_lines):
         body, _eol = _split_eol(raw)
         stripped = body.strip()
@@ -197,6 +206,10 @@ def _find_auth_key_lines(text_lines, section="cookie"):
             continue
         if indent <= section_indent:
             break  # 段结束
+        if child_indent is None:
+            child_indent = indent  # 段内第一个子键的缩进 = 直接子级缩进
+        if indent != child_indent:
+            continue  # 比直接子级更深的键属嵌套，一律不算
         if key == "auth":
             hits.append(index)
     return hits
@@ -225,10 +238,36 @@ def _trailing_after_value(rest):
     return rest[m.start():] if m else ""
 
 
+def _atomic_write(path, data):
+    """同目录临时文件 + ``os.replace`` 的原子落盘。"""
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+    os.replace(tmp_path, path)
+
+
+def _restore_bytes(path, raw_bytes):
+    """把文件还原成本次调用开始时的原始字节；返回 True/False。
+
+    只在「已经动过盘、但后续校验失败」时调用：红线 4 要求绝不静默报成功，
+    但同样不能把半成品（改了一半 / 回读撒谎）留在**生产凭据文件**上。
+    """
+    try:
+        _atomic_write(path, raw_bytes)
+        return True
+    except OSError:
+        return False
+
+
 def write_cookie_auth(yaml_path, cookie_str, backup_path=None):
     """只改写 `cookie:` 段内那一行 `auth:` 的值，其余字节保持不变。
 
-    成功后返回 None；任何前置校验 / 回读校验失败都抛异常（绝不静默成功）。
+    成功后返回 None；任何前置校验 / 回读校验失败都抛异常（绝不静默成功），
+    且**每条拒绝路径都必须让文件逐字节等于调用前**（事务性）。
+
+    执行顺序刻意是「先在内存里渲染并结构校验 → 备份 → 原子落盘 → 回读 →
+    失败则用内存里的原始字节还原」。早期实现把回读校验放在 ``os.replace``
+    **之后**且不做还原，于是「回读撒谎」这条路径会把改写后的文件留在盘上。
     """
     if not isinstance(cookie_str, str) or not cookie_str.strip():
         raise CookieWriteError("拒绝写入空的 cookie.auth")
@@ -267,33 +306,65 @@ def write_cookie_auth(yaml_path, cookie_str, backup_path=None):
     suffix = _trailing_after_value(m.group(3))
     escaped = cookie_str.replace("\\", "\\\\").replace('"', '\\"')
     # 值统一用双引号标量：cookie 值含 ":"、"|"、"/"、"+"、"#" 时裸标量会破 YAML。
-    text_lines[index] = prefix + '"' + escaped + '"' + suffix + eol
+    new_lines = list(text_lines)
+    new_lines[index] = prefix + '"' + escaped + '"' + suffix + eol
+    new_bytes = "".join(new_lines).encode("utf-8", "surrogateescape")
 
-    new_bytes = "".join(text_lines).encode("utf-8", "surrogateescape")
-
-    if new_bytes.count(b"\r\n") != raw_bytes.count(b"\r\n"):
+    # --- 写盘**之前**的结构性预校验：拒绝必须发生在动盘之前 -------------------
+    if len(new_lines) != len(text_lines):
+        raise CookieWriteError("写回后行数发生变化（%d → %d），拒绝写入: %s"
+                               % (len(text_lines), len(new_lines), yaml_path))
+    changed = [i for i in range(len(text_lines)) if text_lines[i] != new_lines[i]]
+    if changed not in ([], [index]):
+        # [] 表示渲染结果与原文完全相同（幂等，本就不需要写盘）；[index] 表示恰好只改 auth 行。
         raise CookieWriteError(
-            "写回后 CRLF 数量发生变化（%d → %d），拒绝写入: %s"
-            % (raw_bytes.count(b"\r\n"), new_bytes.count(b"\r\n"), yaml_path))
+            "写回结构异常：期望只改第 %d 行，实际改动行 %s，拒绝写入: %s"
+            % (index + 1, [i + 1 for i in changed], yaml_path))
+    if (new_bytes.count(b"\n") != raw_bytes.count(b"\n")
+            or new_bytes.count(b"\r") != raw_bytes.count(b"\r")):
+        raise CookieWriteError(
+            "写回后换行约定发生变化（LF %d → %d，CR %d → %d），拒绝写入: %s"
+            % (raw_bytes.count(b"\n"), new_bytes.count(b"\n"),
+               raw_bytes.count(b"\r"), new_bytes.count(b"\r"), yaml_path))
 
+    # --- 备份（先备份后写；备份失败时目标文件尚未被动过） ---------------------
     if backup_path:
-        parent = os.path.dirname(os.path.abspath(backup_path))
-        if parent and not os.path.isdir(parent):
-            os.makedirs(parent, exist_ok=True)
-        with open(backup_path, "wb") as f:
-            f.write(raw_bytes)
+        try:
+            parent = os.path.dirname(os.path.abspath(backup_path))
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, exist_ok=True)
+            with open(backup_path, "wb") as f:
+                f.write(raw_bytes)
+        except OSError as e:
+            raise CookieWriteError("写入备份失败: %s (%s: %s)"
+                                   % (backup_path, type(e).__name__, e))
 
-    if new_bytes != raw_bytes:  # 幂等：值相同则一个字节都不动
-        tmp_path = yaml_path + ".tmp"
-        with open(tmp_path, "wb") as f:
-            f.write(new_bytes)
-        os.replace(tmp_path, yaml_path)
+    # --- 原子落盘（幂等：渲染结果与原文相同则一个字节都不动） -----------------
+    if new_bytes != raw_bytes:
+        try:
+            _atomic_write(yaml_path, new_bytes)
+        except OSError as e:
+            raise CookieWriteError("写盘失败: %s (%s: %s)"
+                                   % (yaml_path, type(e).__name__, e))
 
-    actual = read_cookie_auth(yaml_path)  # ← 回读校验（测试会打桩以自证这条路径真的会触发）
-    if actual != cookie_str:
+    # --- 回读校验；任何不一致都要**先把文件还原成原始字节**再抛 --------------
+    actual = None
+    read_error = None
+    try:
+        # 回读校验（测试会打桩以自证这条路径真的会触发）
+        actual = read_cookie_auth(yaml_path)
+    except Exception as e:  # 读不回来同样不算校验通过，且磁盘状态未知
+        read_error = e
+    if read_error is not None or actual != cookie_str:
+        restored = _restore_bytes(yaml_path, raw_bytes)
+        suffix_note = "" if restored else "；且原文件还原失败"
+        if read_error is not None:
+            raise CookieWriteVerificationError(
+                "写回后回读失败: %s: %s（%s）%s"
+                % (type(read_error).__name__, read_error, yaml_path, suffix_note))
         raise CookieWriteVerificationError(
-            "写回后回读不一致: 期望 %s，实际 %s（%s）"
-            % (_fingerprint(cookie_str), _fingerprint(actual), yaml_path))
+            "写回后回读不一致: 期望 %s，实际 %s（%s）%s"
+            % (_fingerprint(cookie_str), _fingerprint(actual), yaml_path, suffix_note))
     return None
 
 
