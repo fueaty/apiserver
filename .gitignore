@@ -21,6 +21,12 @@ cookie.txt
 tmp/
 temp/
 .cache/
+# write_cookie_auth 用 <配置>.tmp + os.replace 原子落盘；若进程在 replace 前中断，
+# 残留的 config/zhihu.yaml.tmp 里是**实时凭据**，必须确保它不会被当成未跟踪文件提交
+*.tmp
+
+# 忽略 playwright 持久化浏览器 profile（内含实时登录态 Cookie，等同凭证）
+runtime/
 
 # 忽略数据文件
 *.json
