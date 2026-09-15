@@ -449,12 +449,11 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
             LOG.warning("上次状态 %r → 本次 %r：不重复告警",
                         previous or "<无历史>", state)
 
-    if alert:
-        if dry_run:
-            LOG.info("[dry-run] 本应发送通知：%s", alert)
-        else:
-            cookie_store.notify(alert, notifier)
-
+    # ⚠️ 顺序是刻意的：**先把状态转换落盘，再发告警**。
+    # 早期实现先 notify 再 _write_state，于是「通知投递失败」会把已经判定完的状态转换
+    # 一起丢掉（投递失败 ⇒ 状态文件仍是旧状态 ⇒ 下次同类别失败被判成「无变化」而静默）。
+    # 现在无论投递成功 / 失败 / 抛异常，状态文件都已经是本次的新状态。
+    state_written = True
     if dry_run:
         LOG.info("[dry-run] 不写状态文件（实际会写 %s）", resolved_state)
     else:
@@ -465,7 +464,25 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
         except StateWriteError as e:
             LOG.error("状态文件不可用：%s；本次判定 state=%s 无法记账，按运维错误返回 rc=%d",
                       e, state, EXIT_ERROR)
-            return EXIT_ERROR
+            state_written = False
+
+    if alert:
+        if dry_run:
+            LOG.info("[dry-run] 本应发送通知：%s", alert)
+        else:
+            delivered = False
+            try:
+                delivered = bool(cookie_store.notify(alert, notifier))
+            except Exception as e:
+                # cookie_store.notify 的契约是「绝不抛」；这里再兜一层，保证即使那条契约
+                # 被破坏（换实现 / 打补丁 / BaseException 之外的任何东西），也不会把本次
+                # 判定（rc + 已落盘的状态）毁掉。
+                LOG.error("告警投递未预期异常（%s: %s）", type(e).__name__, e)
+            if not delivered:
+                LOG.error("告警投递失败：%s；状态转换已落盘，本次 rc 不受投递结果影响", alert)
+
+    if not state_written:
+        return EXIT_ERROR
 
     rc = EXIT_BY_STATE.get(state, EXIT_ERROR)
     LOG.info("判定结果 state=%s code=%s rc=%d", state, code, rc)

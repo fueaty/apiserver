@@ -24,13 +24,21 @@
 ----------
 本模块**不得**在导入期引入 playwright / 网络 / 通知等副作用；通知走 `notify()` 的
 延迟导入，测试可注入替身（fake）。因此本模块可在无浏览器、无 aiohttp 的机器上导入。
+
+`notify()` 额外保证**绝不抛异常**（含「延迟导入失败」）：告警投递只是副作用，
+它的成败不得改变调用方的判定与记账。早期实现把延迟导入放在 try 之外，于是在
+无 aiohttp 的机器上告警一到期就抛 ImportError，一路逃出 `check()` → rc=1 traceback，
+**告警与状态文件双双丢失**。
 """
 
 import hashlib
+import logging
 import os
 import re
 
 import yaml
+
+LOG = logging.getLogger(__name__)
 
 __all__ = [
     "CookieConfigError",
@@ -143,6 +151,18 @@ def read_cookie_auth(yaml_path):
         raise CookieConfigError("配置文件不是 UTF-8 文本: %s (%s)" % (yaml_path, e))
     except yaml.YAMLError as e:
         raise CookieConfigError("配置文件不是合法 YAML: %s (%s)" % (yaml_path, e))
+    except RecursionError as e:
+        # 深层嵌套（≥ 数百层）会让解析器递归爆栈。这不是「YAML 语法错」，但同样属于
+        # 「这份配置读不动」：必须归到同一个「配置不可用」类别（→ rc=3），绝不能让它
+        # 逃出 check() 变成 rc=1 —— 那种 rc 既不写状态文件也不发告警。
+        raise CookieConfigError(
+            "配置文件嵌套过深，YAML 解析超出递归上限: %s (%s: %s)"
+            % (yaml_path, type(e).__name__, e))
+    except Exception as e:
+        # 兜底：解析期的任何其它失败（MemoryError、解析器内部异常…）都归入「配置不可用」。
+        # 这里**不是**吞异常，而是把它换成一个调用方（check）明确会处理的类别。
+        raise CookieConfigError(
+            "配置文件解析失败: %s (%s: %s)" % (yaml_path, type(e).__name__, e))
 
     if not isinstance(data, dict):
         raise CookieConfigError("配置文件顶层不是映射: %s" % yaml_path)
@@ -377,14 +397,22 @@ def notify(message, notifier=None):
     notifier 为 None 时**延迟导入** app.wework.notification_push 并调用 send_message
     （该模块会拉起 aiohttp/requests，故不能放在导入期）。测试传 fake 即可完全离线。
 
-    返回 True 表示已成功投递；notifier 抛异常时记录并返回 False（不让告警失败拖垮退出码）。
+    返回 True 表示已成功投递；失败返回 False。**本函数绝不抛异常** —— 延迟导入失败
+    （例如机器上没有 aiohttp，这正是本模块声明支持、且很可能就是跑 --check 的那台机器）
+    与投递本身失败一视同仁：记录日志、返回 False，由调用方决定怎么降级。
+
+    ⚠️ 延迟导入必须在 try **内部**。早期实现把它放在 try 之前，于是「无 aiohttp 的机器」
+    上只要告警一到期就抛 ImportError，逃出 notify → 逃出 check（它只接
+    CookieAuthMissingError/CookieConfigError）→ **rc=1 traceback：告警没发出去，
+    连状态文件都没写**。这条路径正是模块声称要支持的部署形态，反而最先炸。
     """
-    if notifier is None:
-        from app.wework.notification_push import send_message  # noqa: PLC0415  延迟导入是刻意的
-        notifier = send_message
     try:
+        if notifier is None:
+            from app.wework.notification_push import send_message  # noqa: PLC0415  延迟导入是刻意的
+            notifier = send_message
         notifier(message)
         return True
     except Exception as e:  # 通知失败不应改变 --check 的判定结果
-        print("发送通知失败: %s: %s" % (type(e).__name__, e))
+        LOG.error("发送通知失败（%s: %s）：告警未投递，内容=%s",
+                  type(e).__name__, e, message)
         return False

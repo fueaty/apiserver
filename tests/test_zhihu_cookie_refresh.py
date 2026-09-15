@@ -526,6 +526,48 @@ def _cfg_and_state(tmp, name="zhihu.yaml"):
     return cfg, os.path.join(tmp, "state_%s.json" % name)
 
 
+def _read_json(path):
+    """读 JSON，**不抛异常**：把「不存在 / 读不动 / JSON 坏」变成可断言的 (data, err)。
+
+    变异验证时的关键差别：若断言写成 `json.load(open(state, ...))`，那么「注入的 state_path
+    被丢弃」这个变异会让文件不存在 → FileNotFoundError → **subprocess crash**（还算不上
+    behavior 检出，且取决于运行环境的路径是否凑巧存在）。改成返回 (data, err) 后，同一个
+    变异变成一条普通的 [FAIL] 断言，带上下面的行号。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f), ""
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+def _read_text(path):
+    """读文本，**不抛异常**；理由同 `_read_json`。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read(), ""
+    except Exception as e:
+        return "", "%s: %s" % (type(e).__name__, e)
+
+
+def _state_field(path, field):
+    """读状态文件的某个字段，返回 (value, err)；文件缺失/坏掉时 err 非空、value 为 None。"""
+    data, err = _read_json(path)
+    if err:
+        return None, err
+    if not isinstance(data, dict):
+        return None, "状态文件顶层不是对象: %r" % (data,)
+    return data.get(field), ""
+
+
+def _assert_state(name, path, field, expected):
+    """断言「注入的 state_path 上确实写成了期望值」——落盘位置与内容一起被锁住。"""
+    value, err = _state_field(path, field)
+    check(name, err == "" and value == expected,
+          "path=%s %s=%r（期望 %r）err=%s" % (path, field, value, expected, err or "-"))
+    return value
+
+
 # ---------------------------------------------------------------------------
 # [7] 仅在状态变化时告警
 # ---------------------------------------------------------------------------
@@ -546,11 +588,10 @@ def test_notify_only_on_state_change():
         check("[7] 告警含人工动作 --login", "--login" in msg, msg)
         check("[7] 告警不含 cookie 明文",
               "DUMMY_COOKIE" not in msg and "z_c0=" not in msg, msg)
-    check("[7] 状态文件已写入且 status=auth_failed",
-          json.load(open(state, encoding="utf-8")).get("status") == "auth_failed", "")
-    raw_state = open(state, encoding="utf-8").read()
+    _assert_state("[7] 状态文件已写入且 status=auth_failed", state, "status", "auth_failed")
+    raw_state, raw_err = _read_text(state)
     check("[7] 状态文件不含 cookie 明文",
-          "DUMMY_COOKIE" not in raw_state and "z_c0=" not in raw_state, "")
+          raw_err == "" and "DUMMY_COOKIE" not in raw_state and "z_c0=" not in raw_state, raw_err)
 
     rc2 = tool.check(config_path=cfg, state_path=state,
                      fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=recorder)
@@ -602,7 +643,7 @@ def test_exit_codes_and_notify():
     rc2 = tool.check(config_path=cfg2, state_path=state2, fetcher=fetcher2, notifier=recorder2)
     check("[9] 200 + 非空 data → rc==0", rc2 == 0, "rc=%r" % (rc2,))
     check("[9] 正常态 → **不告警**", recorder2.messages == [], "n=%d" % len(recorder2.messages))
-    check("[9] 状态文件 status=ok", json.load(open(state2, encoding="utf-8")).get("status") == "ok", "")
+    _assert_state("[9] 状态文件 status=ok", state2, "status", "ok")
 
     # 200 但 data 为空 / body 不可解析 → rc==3（不是 0）
     for label, body in (("data 为空列表", json.dumps({"data": []})),
@@ -650,8 +691,7 @@ def test_transport_error():
     check("[10] 缺凭证 → 告警恰好 1 次且点名 --login",
           len(rec3.messages) == 1 and "--login" in rec3.messages[0],
           "n=%d" % len(rec3.messages))
-    check("[10] 缺凭证 → 状态文件 status=auth_failed",
-          json.load(open(state3, encoding="utf-8")).get("status") == "auth_failed", "")
+    _assert_state("[10] 缺凭证 → 状态文件 status=auth_failed", state3, "status", "auth_failed")
     check("[10] 缺凭证 → 不去打网络（fetcher 未被调用）", fetch3.calls == 0,
           "calls=%d" % fetch3.calls)
 
@@ -807,10 +847,20 @@ def test_login_refresh_alert_path_offline():
         tool._browser_cookie_string = real_browser
 
     check("[15] --refresh 拿到 cookie 且校验 401 → rc==2", rc == 2, "rc=%r" % (rc,))
-    check("[15] --refresh 的失败走了**注入的** notifier（1 次告警）", len(rec.messages) == 1,
+    # 断言「注入的 notifier 收到了什么」而不是「没崩」：把 notifier 在透传链上弄丢
+    # （do_refresh → check）会让真实企微通道被尝试，在有 aiohttp 的机器上就是一次真外呼；
+    # 这里锁住**调用次数 + 文案内容**，丢掉注入就一定是一条断言失败。
+    check("[15] --refresh 的失败走了**注入的** notifier（恰好 1 次）", len(rec.messages) == 1,
           "n=%d" % len(rec.messages))
-    check("[15] 注入的 state_path 被真实使用（state=auth_failed）",
-          json.load(open(state, encoding="utf-8")).get("status") == "auth_failed", "")
+    if rec.messages:
+        msg = rec.messages[0]
+        check("[15] 注入 notifier 收到的文案含 code=100 与 --login",
+              "code=100" in msg and "--login" in msg, msg)
+        check("[15] 注入 notifier 收到的文案不含 cookie 明文",
+              "DUMMY_COOKIE" not in msg and "z_c0=" not in msg, msg)
+    _assert_state("[15] 注入的 state_path 被真实使用（state=auth_failed）",
+                  state, "status", "auth_failed")
+    _assert_state("[15] 注入的 state_path 上记的 code 是接口 code=100", state, "code", 100)
     check("[15] --refresh 已把新 cookie 写回（回读一致）",
           cookie_store.read_cookie_auth(cfg) == NEW_COOKIE, "")
 
@@ -826,6 +876,10 @@ def test_login_refresh_alert_path_offline():
     check("[15] 第二次同值 → 文件字节未变（跳过写回）", open(cfg, "rb").read() == before, "")
     check("[15] auth_failed → ok → 发恢复通知 1 次", len(rec2.messages) == 1,
           "n=%d" % len(rec2.messages))
+    if rec2.messages:
+        check("[15] 恢复通知也走注入的 notifier（文案含『已恢复』）",
+              "已恢复" in rec2.messages[0], rec2.messages[0])
+    _assert_state("[15] 恢复后注入的 state_path 上 status=ok", state, "status", "ok")
 
     # --login 走同一条公共流程：假浏览器返回空串 → 必须是 2（未完成扫码登录），且不发通知
     try:
@@ -1056,9 +1110,10 @@ def test_non200_statuses():
             check("[16] HTTP %d 告警类别正确（403/429 标风控，500/302 不标）" % status,
                   ("风控" in msg) == (status in (403, 429)), msg)
         expect_state = "anti_bot" if status in (403, 429) else "error"
-        check("[16] HTTP %d 状态文件 status=%s" % (status, expect_state),
-              os.path.exists(state)
-              and json.load(open(state, encoding="utf-8")).get("status") == expect_state, "")
+        _assert_state("[16] HTTP %d 状态文件 status=%s" % (status, expect_state),
+                      state, "status", expect_state)
+        _assert_state("[16] HTTP %d 状态文件 code 回落为 HTTP 状态码" % status,
+                      state, "code", status)
 
         # 2) 同一类别再来一次 → 不重复告警
         rec2 = _Recorder()
@@ -1109,8 +1164,17 @@ def test_401_without_code():
         check("[17] 401（%s）→ 告警 1 次且点名 --login" % label,
               len(rec.messages) == 1 and "--login" in rec.messages[0],
               "n=%d" % len(rec.messages))
-        check("[17] 401（%s）→ 状态文件 status=auth_failed" % label,
-              json.load(open(state, encoding="utf-8")).get("status") == "auth_failed", "")
+        _assert_state("[17] 401（%s）→ 状态文件 status=auth_failed" % label,
+                      state, "status", "auth_failed")
+        # --- U2：`api_code if api_code is not None else status` 这层回落必须被**值**锁住 ---
+        # 去掉回落时 suite 仍然全绿（rc 还是 2），但 state.code 变成 null、告警文案从
+        # code=401 变成 code=n/a —— 运维就无法从告警里看出到底哪个状态码触发的。
+        _assert_state("[17] D4 tool:205 401（%s）→ state.code 回落为 HTTP 401（不是 null）" % label,
+                      state, "code", 401)
+        if rec.messages:
+            check("[17] D4 tool:205 401（%s）→ 告警文案带状态码回落 code=401" % label,
+                  "code=401" in rec.messages[0] and "code=n/a" not in rec.messages[0],
+                  rec.messages[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1285,8 +1349,8 @@ def test_tool_wiring_locks():
         tool._browser_cookie_string = real_browser
     check("[20] D4 tool:507 写回失败但校验通过 → 降级 rc==3",
           crash3 is None and rc3 == 3, "rc=%r crash=%s" % (rc3, crash3))
-    check("[20] D4 tool:507 此时就地校验确实通过了（状态文件被写成 ok）",
-          json.load(open(state3, encoding="utf-8")).get("status") == "ok", "")
+    _assert_state("[20] D4 tool:507 此时就地校验确实通过了（状态文件被写成 ok）",
+                  state3, "status", "ok")
 
 
 # ---------------------------------------------------------------------------
@@ -1315,6 +1379,17 @@ def test_fake_notifier_is_the_one_used():
           len(seen) == 1 and seen[0][1] is rec,
           repr([type(s[1]).__name__ if s[1] is not None else None for s in seen]))
     check("[21] 注入的 fake notifier 真的收到告警", rec.messages != [], "")
+    # --- M18：把「传 notifier」这半边去掉（cookie_store.notify(alert)）必须是一条**断言**
+    # 失败，而不是靠「延迟导入在无 aiohttp 机器上抛 ImportError」把进程崩掉才红。
+    # 断言注入方**收到的参数与文案内容**：调用次数 + 消息内容 + 消息同源。
+    check("[21] 注入的 notifier 恰好被调用 1 次（调用次数被锁住）", len(rec.messages) == 1,
+          "n=%d" % len(rec.messages))
+    if rec.messages:
+        check("[21] 注入的 notifier 收到的文案含 code=100 / 站点 zhihu / 人工动作 --login",
+              "code=100" in rec.messages[0] and "zhihu" in rec.messages[0]
+              and "--login" in rec.messages[0], rec.messages[0])
+        check("[21] cookie_store.notify 收到的 message 与 notifier 收到的是同一条",
+              seen and seen[0][0] == rec.messages[0], repr(seen[:1]))
     check("[21] 全程未导入 app.wework.notification_push（零外呼的必要条件之一）",
           "app.wework.notification_push" not in sys.modules, "已被导入")
 
@@ -1441,6 +1516,260 @@ def test_corrupt_state_file_is_visible():
               any(n in blob for n in needles), blob[-400:])
 
 
+# ---------------------------------------------------------------------------
+# [24] E1：告警投递失败不得吞掉状态转换、不得改 rc、也不得静默
+# ---------------------------------------------------------------------------
+def test_alert_delivery_failure_is_contained():
+    print("\n[24] E1: 告警投递失败（含 notifier 延迟导入失败）→ 不崩 / rc 类别码 / 状态已落盘")
+    # 场景构造：notifier=None 时 cookie_store.notify 会
+    #   `from app.wework.notification_push import send_message`（该模块拉起 aiohttp）。
+    # 往 sys.modules 里塞 None 可以让这次延迟导入**确定性地**抛 ImportError —— 不依赖
+    # 「本机恰好没装 aiohttp」。生产机装了 aiohttp，靠真实 ImportError 会变成一次真的
+    # 企微 webhook 外呼，那是不能接受的测试副作用。
+    mod_name = "app.wework.notification_push"
+    check("[24] 场景自证：测试开始时未导入 notification_push", mod_name not in sys.modules,
+          "已被导入")
+
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "notifyfail.yaml")
+
+    handler, records = _log_capture()
+    crashed, rc, direct = None, None, None
+    real_notify = cookie_store.notify
+    sys.modules[mod_name] = None  # None → `from X import Y` 抛 ImportError（确定性、离线）
+    try:
+        try:
+            direct = real_notify("probe-alert", None)  # 直接证明 notify 自己不抛
+        except Exception as e:  # noqa: BLE001  被测的就是「绝不抛」这条契约
+            direct = "RAISED %s: %s" % (type(e).__name__, e)
+        rc, crashed = _check_catching(config_path=cfg, state_path=state,
+                                      fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=None)
+    finally:
+        del sys.modules[mod_name]
+        tool.LOG.removeHandler(handler)
+    blob = "\n".join(r.getMessage() for r in records)
+
+    check("[24] E1 cs:383 延迟导入失败时 cookie_store.notify 自己不抛且返回 False",
+          direct is False, repr(direct))
+    check("[24] E1 tool:456 告警投递失败时**没有任何异常逃出 check()**", crashed is None,
+          crashed or "")
+    check("[24] E1 退出码是类别码 rc==2（不是 1/9 那种『无状态无告警』的崩溃码）", rc == 2,
+          "rc=%r crashed=%s" % (rc, crashed))
+    # 「投递成败」与「状态转换是否落盘」必须彻底解耦
+    _assert_state("[24] E1 投递失败后状态文件**已写入**且 status=auth_failed",
+                  state, "status", "auth_failed")
+    _assert_state("[24] E1 投递失败后状态文件仍带完整判定信息（code=100）", state, "code", 100)
+    check("[24] E1 投递失败被**明确记录**（不是静默吞掉）", "告警投递失败" in blob, blob[-600:])
+    check("[24] 未把 notification_push 留在 sys.modules（测试自身无污染）",
+          mod_name not in sys.modules, "残留")
+
+    # 变体 1：注入的 notifier 自己抛 → 同样「不崩 / rc 类别码 / 状态已落盘 / 有明确日志」
+    tmp2 = _workdir()
+    cfg2, state2 = _cfg_and_state(tmp2, "notifyraise.yaml")
+
+    def exploding_notifier(_message):
+        raise RuntimeError("webhook 500")
+
+    handler2, records2 = _log_capture()
+    rc2, crash2 = None, None
+    try:
+        rc2, crash2 = _check_catching(config_path=cfg2, state_path=state2,
+                                      fetcher=_FakeFetcher(401, BODY_CODE_100),
+                                      notifier=exploding_notifier)
+    finally:
+        tool.LOG.removeHandler(handler2)
+    blob2 = "\n".join(r.getMessage() for r in records2)
+    check("[24] E1 注入 notifier 抛异常 → 不抛未捕获异常且 rc==2",
+          crash2 is None and rc2 == 2, "rc=%r crash=%s" % (rc2, crash2))
+    _assert_state("[24] E1 注入 notifier 抛异常 → 状态文件仍然落盘", state2, "status",
+                  "auth_failed")
+    check("[24] E1 注入 notifier 抛异常 → 投递失败被明确记录",
+          "告警投递失败" in blob2, blob2[-600:])
+
+    # 变体 2（顺序锁）：把 cookie_store.notify 换成**会抛**的实现 —— 也就是「绝不抛」这条
+    # 契约被破坏。此时状态转换必须**已经落盘**（先写状态、再发告警），异常也不得逃出 check()。
+    # 顺序一旦倒过来（先发告警再写状态），这条就红。
+    tmp3 = _workdir()
+    cfg3, state3 = _cfg_and_state(tmp3, "notifyorder.yaml")
+
+    def catastrophic_notify(_message, _notifier=None):
+        raise RuntimeError("notify 实现被替换成会抛的版本")
+
+    handler3, records3 = _log_capture()
+    rc3, crash3 = None, None
+    real_notify3 = cookie_store.notify
+    cookie_store.notify = catastrophic_notify
+    try:
+        rc3, crash3 = _check_catching(config_path=cfg3, state_path=state3,
+                                      fetcher=_FakeFetcher(401, BODY_CODE_100),
+                                      notifier=_Recorder())
+    finally:
+        cookie_store.notify = real_notify3
+        tool.LOG.removeHandler(handler3)
+    blob3 = "\n".join(r.getMessage() for r in records3)
+    check("[24] E1 notify 契约被破坏（每次都抛）→ 异常不逃出 check() 且 rc==2",
+          crash3 is None and rc3 == 2, "rc=%r crash=%s" % (rc3, crash3))
+    _assert_state("[24] E1 **顺序锁**：notify 抛掉时状态转换已经落盘（先写状态、后发告警）",
+                  state3, "status", "auth_failed")
+    check("[24] E1 notify 抛掉时也有明确日志（未预期异常 / 投递失败）",
+          "告警投递" in blob3, blob3[-600:])
+
+    # 顺序锁（不依赖异常的可观察事件序列）：状态落盘必须发生在告警投递之前
+    tmp4 = _workdir()
+    cfg4, state4 = _cfg_and_state(tmp4, "notifyorder2.yaml")
+    order = []
+    real_writer = tool._write_state
+    real_notify4 = cookie_store.notify
+
+    def spying_writer(path, record):
+        order.append("write_state")
+        return real_writer(path, record)
+
+    def spying_notify(message, notifier=None):
+        order.append("notify")
+        return real_notify4(message, notifier)
+
+    tool._write_state = spying_writer
+    cookie_store.notify = spying_notify
+    try:
+        rc4, crash4 = _check_catching(config_path=cfg4, state_path=state4,
+                                      fetcher=_FakeFetcher(401, BODY_CODE_100),
+                                      notifier=_Recorder())
+    finally:
+        tool._write_state = real_writer
+        cookie_store.notify = real_notify4
+    check("[24] E1 事件顺序：状态落盘**先于**告警投递", order == ["write_state", "notify"],
+          repr(order))
+    check("[24] E1 顺序锁场景本身有效（有告警被投递且 rc==2）",
+          crash4 is None and rc4 == 2 and order == ["write_state", "notify"],
+          "rc=%r crash=%s order=%r" % (rc4, crash4, order))
+
+
+# ---------------------------------------------------------------------------
+# [25] E2：深层嵌套 YAML（解析爆栈）必须归入「配置不可用」，而不是崩成 rc=1
+# ---------------------------------------------------------------------------
+def test_deep_yaml_is_config_error():
+    print("\n[25] E2: 深层嵌套 YAML → 解析爆栈被收敛成『配置不可用』rc==3（不崩、不告警）")
+    import yaml
+
+    depth = 900
+    text = "\n".join([" " * i + "k%d:" % i for i in range(depth)]) + "\n" + " " * depth + "v\n"
+    tmp = _workdir()
+    deep = _write_text(os.path.join(tmp, "deep.yaml"), text)
+    state = os.path.join(tmp, "deep_state.json")
+
+    # 场景自证：这份文本确实会让 safe_load 爆栈 —— 否则本用例什么都没测
+    boom = ""
+    try:
+        with open(deep, encoding="utf-8") as f:
+            yaml.safe_load(f.read())
+    except RecursionError:
+        boom = "RecursionError"
+    except Exception as e:  # noqa: BLE001  别的异常类型下这条自证会用另一种方式红
+        boom = "%s: %s" % (type(e).__name__, e)
+    check("[25] 场景自证：该 YAML 确实让 yaml.safe_load 抛 RecursionError",
+          boom == "RecursionError", "boom=%r" % (boom,))
+
+    raised = ""
+    try:
+        cookie_store.read_cookie_auth(deep)
+    except cookie_store.CookieConfigError:
+        raised = "CookieConfigError"
+    except Exception as e:  # noqa: BLE001
+        raised = "%s: %s" % (type(e).__name__, e)
+    check("[25] E2 cs:140 深嵌套 → 收敛为 CookieConfigError（不再是 RecursionError）",
+          raised == "CookieConfigError", repr(raised))
+
+    rec = _Recorder()
+    rc, crashed = _check_catching(config_path=deep, state_path=state,
+                                  fetcher=_FakeFetcher(200, _ok_body()), notifier=rec)
+    check("[25] E2 tool:399 深嵌套 → 不抛未捕获异常", crashed is None, crashed or "")
+    check("[25] E2 tool:399 深嵌套 → rc==3（配置不可用，不是 rc=1 崩溃）", rc == 3,
+          "rc=%r crashed=%s" % (rc, crashed))
+    check("[25] 深嵌套不误判为认证失败（不 @all 告警）", rec.messages == [],
+          "n=%d" % len(rec.messages))
+
+
+# ---------------------------------------------------------------------------
+# [26] U1：--login / --refresh 的写回必须产生**可观察的文件效果**
+# ---------------------------------------------------------------------------
+def test_login_refresh_writeback_is_observable():
+    print("\n[26] U1: --login/--refresh 的写回锁在『文件字节变了 + 回读是新值』上")
+    tmp = _workdir()
+    real_browser = tool._browser_cookie_string
+
+    def fake_browser(value):
+        return lambda headless, timeout_s, settle_ms: (value, "")  # noqa: E731
+
+    # --- --login：真实配置的**字节副本** + 假浏览器缝，断言可观察的文件效果 ---
+    cfg = _copy_real(tmp, "login_flow.yaml")
+    state = os.path.join(tmp, "login_state.json")
+    original_auth = cookie_store.read_cookie_auth(cfg)
+    before = open(cfg, "rb").read()
+    before_lines = len(before.splitlines(keepends=True))
+    login_cookie = NEW_COOKIE + "; login=1"
+    check("[26] 场景自证：浏览器给出的新串 != 磁盘现值（否则『文件变了』无从谈起）",
+          login_cookie != original_auth, "新串与现值不同")
+
+    rc, crashed = None, None
+    try:
+        tool._browser_cookie_string = fake_browser(login_cookie)
+        rc = tool.do_login(config_path=cfg, state_path=state,
+                           fetcher=_FakeFetcher(200, _ok_body()), notifier=_Recorder())
+    except Exception as e:  # noqa: BLE001
+        crashed = "%s: %s" % (type(e).__name__, e)
+    finally:
+        tool._browser_cookie_string = real_browser
+
+    check("[26] --login 全流程不抛异常", crashed is None, crashed or "")
+    check("[26] --login 拿到 cookie 且校验 200 → rc==0", rc == 0, "rc=%r" % (rc,))
+    after = open(cfg, "rb").read()
+    check("[26] U1 tool:585 --login 之后配置文件**字节确实变了**（写回不是空炮）",
+          after != before, "字节未变 ⇒ do_login 的写回没发生（变异『改成 pass』就死在这里）")
+    check("[26] U1 --login 回读配置 == 浏览器刚拿到的 cookie",
+          cookie_store.read_cookie_auth(cfg) == login_cookie,
+          "回读 %s" % cookie_store._fingerprint(cookie_store.read_cookie_auth(cfg)))
+    check("[26] --login 写回仍只改 auth 行（行数不变）",
+          len(after.splitlines(keepends=True)) == before_lines, "")
+    _assert_state("[26] --login 的就地校验把注入的 state_path 写成 ok", state, "status", "ok")
+
+    # --- --refresh：同一条链（apply_refreshed_cookie → _write_back），同样锁文件效果 ---
+    cfg2 = _copy_real(tmp, "refresh_flow.yaml")
+    state2 = os.path.join(tmp, "refresh_state.json")
+    before2 = open(cfg2, "rb").read()
+    refresh_cookie = NEW_COOKIE + "; refresh=1"
+    rc2, crash2 = None, None
+    try:
+        tool._browser_cookie_string = fake_browser(refresh_cookie)
+        rc2 = tool.do_refresh(config_path=cfg2, state_path=state2,
+                              fetcher=_FakeFetcher(200, _ok_body()), notifier=_Recorder())
+    except Exception as e:  # noqa: BLE001
+        crash2 = "%s: %s" % (type(e).__name__, e)
+    finally:
+        tool._browser_cookie_string = real_browser
+
+    check("[26] --refresh 全流程不抛异常", crash2 is None, crash2 or "")
+    check("[26] --refresh → rc==0", rc2 == 0, "rc=%r" % (rc2,))
+    check("[26] U1 --refresh 之后配置文件**字节确实变了**",
+          open(cfg2, "rb").read() != before2, "字节未变")
+    check("[26] U1 --refresh 回读配置 == 浏览器刚拿到的 cookie",
+          cookie_store.read_cookie_auth(cfg2) == refresh_cookie, "")
+    _assert_state("[26] --refresh 的就地校验把注入的 state_path 写成 ok", state2, "status", "ok")
+
+    # --- 反面对照：--dry-run 下同一流程**不得**动车上的文件 ---
+    # 没有这条，「文件变了」也可能是别的原因造成的；有了它，变与不变都由写回单独解释。
+    cfg3 = _copy_real(tmp, "dry_login.yaml")
+    before3 = open(cfg3, "rb").read()
+    try:
+        tool._browser_cookie_string = fake_browser(NEW_COOKIE + "; dry=1")
+        tool.do_login(config_path=cfg3, dry_run=True, state_path=os.path.join(tmp, "dry.json"),
+                      fetcher=_FakeFetcher(200, _ok_body()), notifier=_Recorder())
+    finally:
+        tool._browser_cookie_string = real_browser
+    check("[26] 反面对照：--login --dry-run → 文件字节一个都没动",
+          open(cfg3, "rb").read() == before3, "")
+
+
 def main():
     print("=" * 70)
     print("知乎 Cookie 工具行为级测试（离线）：写入守卫 / EOL / 幂等 / 回读校验 / 状态变化告警")
@@ -1473,6 +1802,9 @@ def main():
     test_fake_notifier_is_the_one_used()
     test_no_network_egress()
     test_corrupt_state_file_is_visible()
+    test_alert_delivery_failure_is_contained()
+    test_deep_yaml_is_config_error()
+    test_login_refresh_writeback_is_observable()
     test_real_config_untouched()
 
     print("=" * 70)
