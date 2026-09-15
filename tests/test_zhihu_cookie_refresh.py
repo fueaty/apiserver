@@ -191,6 +191,11 @@ def test_parse_format():
     round_trip = cookie_store.format_cookie_header(cookie_store.parse_cookie_header(TRICKY_COOKIE))
     check("[1] round-trip: parse→format→parse 等价", cookie_store.parse_cookie_header(round_trip) == parsed, "")
     check("[1] round-trip: 段数仍为 6", len(round_trip.split("; ")) == 6, "segments=%d" % len(round_trip.split("; ")))
+    sorted_header = "a=1; b=2; c=3"
+    check("[1] round-trip: 已排序头的 parse→format 逐字节还原（真·round-trip）",
+          cookie_store.format_cookie_header(cookie_store.parse_cookie_header(sorted_header)) == sorted_header, "")
+    check("[1] parse 返回 dict，故未排序头经 format 会**按键归一化排序**（设计如此，非丢数据）",
+          cookie_store.format_cookie_header(cookie_store.parse_cookie_header("z=1; a=2")) == "a=2; z=1", "")
 
 
 def _type_error_fires():
@@ -318,15 +323,47 @@ def _backup_works(tmp):
 # ---------------------------------------------------------------------------
 # [5] 守卫必须拒绝：auth 行 0 条 / 2 条
 # ---------------------------------------------------------------------------
+def _expect_rejects_without_touching(label, path, fn):
+    """前置校验失败必须同时满足：① 抛 CookieWriteError；② **一个字节都不写**。
+
+    ② 才是「不猜改哪一条」这条守卫的独立鉴别点，只断言 ① 会漏掉一种假实现：
+    先闷头改第一条 auth 行、再靠**写后回读**把不一致兜回来 —— PyYAML 接受重复键
+    （后者胜出），所以回读必然不等 ⇒ 也抛 CookieWriteError，测试全绿，但
+    「auth 行必须唯一」实际上已经失效。变异 M1 就是靠 ② 才被检出。
+    """
+    before = open(path, "rb").read()
+    _expect_raises(label, cookie_store.CookieWriteError, fn)
+    check(label + "｜且该文件一个字节都没动", open(path, "rb").read() == before,
+          "文件被改动了 → 前置唯一性校验形同虚设")
+
+
+def _dup_key_last_wins(path):
+    """自证：文件里有多条 ``auth:`` 行时，``yaml.safe_load`` **不报错**（静默取最后一条）。
+
+    这正是"只断言抛错的用例可以被回读守卫顶替"的根因；把这条场景事实也钉住，
+    以后若换成严格 YAML 解析器（重复键报错），本用例会提醒你回来看唯一的鉴别点。
+    """
+    import yaml
+    with open(path, "rb") as f:
+        text = f.read().decode("utf-8")
+    if len(re.findall(r"(?m)^[ \t]*auth[ \t]*:", text)) < 2:
+        return False
+    try:
+        loaded = yaml.safe_load(text)["cookie"]["auth"]
+    except Exception:
+        return False
+    return bool(loaded)
+
+
 def test_guard_rejects():
     print("\n[5] write_cookie_auth：结构守卫（0 条 / 2 条 auth）必须拒绝")
     tmp = _workdir()
 
     missing = _write_text(os.path.join(tmp, "no_auth.yaml"),
                           "cookie:\n  z_c0: \"x\"\n  _xsrf: \"y\"\napi:\n  base_url: \"https://www.zhihu.com\"\n")
-    _expect_raises("[5] cookie 段内 0 条 auth: → 抛 CookieWriteError",
-                   cookie_store.CookieWriteError,
-                   lambda: cookie_store.write_cookie_auth(missing, NEW_COOKIE))
+    _expect_rejects_without_touching(
+        "[5] cookie 段内 0 条 auth: → 拒绝",
+        missing, lambda: cookie_store.write_cookie_auth(missing, NEW_COOKIE))
     _expect_raises("[5] 同文件 read_cookie_auth 也抛 CookieConfigError",
                    cookie_store.CookieConfigError,
                    lambda: cookie_store.read_cookie_auth(missing))
@@ -335,17 +372,19 @@ def test_guard_rejects():
     duplicated = sanitized.replace('  auth: "DUMMY_COOKIE"',
                                    '  auth: "DUMMY_COOKIE"\n  auth: "DUMMY_COOKIE_2"')
     dup_path = _write_text(os.path.join(tmp, "dup_auth.yaml"), duplicated)
-    _expect_raises("[5] cookie 段内 2 条 auth: → 抛 CookieWriteError（不猜改哪条）",
-                   cookie_store.CookieWriteError,
-                   lambda: cookie_store.write_cookie_auth(dup_path, NEW_COOKIE))
+    _expect_rejects_without_touching(
+        "[5] cookie 段内 2 条 auth: → 拒绝（不猜改哪条）",
+        dup_path, lambda: cookie_store.write_cookie_auth(dup_path, NEW_COOKIE))
     check("[5] 场景自证：重复副本确实含 2 条 auth 行",
           duplicated.count('auth: "DUMMY') == 2, "n=%d" % duplicated.count('auth: "DUMMY'))
+    check("[5] 场景自证：重复键被 PyYAML 静默接受（后者胜出）——这正是回读守卫会顶替唯一性守卫的原因",
+          _dup_key_last_wins(dup_path), "")
 
     outside = _write_text(os.path.join(tmp, "outside.yaml"),
                           "cookie:\n  z_c0: \"x\"\nother:\n  auth: \"not-inside-cookie\"\n")
-    _expect_raises("[5] auth: 在 cookie 段之外 → 仍视为 0 条并拒绝",
-                   cookie_store.CookieWriteError,
-                   lambda: cookie_store.write_cookie_auth(outside, NEW_COOKIE))
+    _expect_rejects_without_touching(
+        "[5] auth: 在 cookie 段之外 → 视为 0 条并拒绝",
+        outside, lambda: cookie_store.write_cookie_auth(outside, NEW_COOKIE))
 
     empty = _write_text(os.path.join(tmp, "empty_auth.yaml"), 'cookie:\n  auth: ""\n')
     _expect_raises("[5] 写入空串 → 拒绝",
@@ -564,6 +603,37 @@ def test_transport_error():
                      notifier=_Recorder())
     check("[10] 配置文件不存在 → rc==3", rc2 == 3, "rc=%r" % (rc2,))
 
+    # 文件存在、YAML 合法，但**没有凭证** —— 这是 zhihu 站点最可能的生产失效形态
+    # （读不到 cookie.auth ⇒ 一直 0 条入库且不报错）。必须 rc==2 且发告警，绝不能静默 rc==3。
+    tmp3 = _workdir()
+    no_auth_key = _write_text(os.path.join(tmp3, "no_auth_key.yaml"), 'cookie:\n  z_c0: ""\n')
+    state3 = os.path.join(tmp3, "state.json")
+    rec3, fetch3 = _Recorder(), _FakeFetcher(200, _ok_body())
+    rc3 = tool.check(config_path=no_auth_key, state_path=state3, fetcher=fetch3, notifier=rec3)
+    check("[10] 缺 cookie.auth 键 → rc==2（不是 3，不静默）", rc3 == 2, "rc=%r" % (rc3,))
+    check("[10] 缺凭证 → 告警恰好 1 次且点名 --login",
+          len(rec3.messages) == 1 and "--login" in rec3.messages[0],
+          "n=%d" % len(rec3.messages))
+    check("[10] 缺凭证 → 状态文件 status=auth_failed",
+          json.load(open(state3, encoding="utf-8")).get("status") == "auth_failed", "")
+    check("[10] 缺凭证 → 不去打网络（fetcher 未被调用）", fetch3.calls == 0,
+          "calls=%d" % fetch3.calls)
+
+    tmp4 = _workdir()
+    blank = _write_text(os.path.join(tmp4, "blank.yaml"), 'cookie:\n  auth: ""\n')
+    state4 = os.path.join(tmp4, "state.json")
+    rec4 = _Recorder()
+    rc4 = tool.check(config_path=blank, state_path=state4,
+                     fetcher=_FakeFetcher(200, _ok_body()), notifier=rec4)
+    check("[10] cookie.auth 为空串 → rc==2 且告警 1 次",
+          rc4 == 2 and len(rec4.messages) == 1, "rc=%r n=%d" % (rc4, len(rec4.messages)))
+
+    tmp5 = _workdir()
+    broken = _write_text(os.path.join(tmp5, "broken.yaml"), "cookie:\n  auth: [unclosed\n")
+    rc5 = tool.check(config_path=broken, state_path=os.path.join(tmp5, "s.json"),
+                     fetcher=_FakeFetcher(200, _ok_body()), notifier=_Recorder())
+    check("[10] YAML 语法坏 → rc==3（配置/运维问题，不 @all）", rc5 == 3, "rc=%r" % (rc5,))
+
 
 # ---------------------------------------------------------------------------
 # [11] --dry-run 不得落任何盘
@@ -599,6 +669,8 @@ def test_state_path_ignored():
     check("[12] 该路径确实被 git 忽略（%s）" % rel, tool._git_ignored(rel) is True, rel)
     check("[12] runtime/ profile 目录也已被忽略（内含实时登录态）",
           tool._git_ignored("runtime/zhihu_profile/Cookies") is True, "runtime/zhihu_profile/Cookies")
+    check("[12] write_cookie_auth 的原子落盘临时文件也被忽略（否则中途中断会残留实时凭据）",
+          tool._git_ignored("config/zhihu.yaml.tmp") is True, "config/zhihu.yaml.tmp")
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +681,102 @@ def test_real_config_untouched():
     check("[13] md5 与测试开始时一致", _md5(REAL_YAML) == REAL_MD5_AT_IMPORT,
           "%s vs %s" % (REAL_MD5_AT_IMPORT, _md5(REAL_YAML)))
     check("[13] 行数仍为 46 行", len(_lines(REAL_YAML)) == 46, "n=%d" % len(_lines(REAL_YAML)))
+
+
+# ---------------------------------------------------------------------------
+# [14] --refresh 的写回判据（无需浏览器即可验证）
+# ---------------------------------------------------------------------------
+def test_refresh_write_decision():
+    print("\n[14] --refresh 写回判据：只在真变化时落盘 + 写后复验")
+    tmp = _workdir()
+    cfg = _write_text(os.path.join(tmp, "refresh.yaml"), _sanitized_real_text())
+    cookie_store.write_cookie_auth(cfg, NEW_COOKIE)  # 先让磁盘上就是 NEW_COOKIE
+    before = open(cfg, "rb").read()
+
+    wrote_same = tool.apply_refreshed_cookie(cfg, NEW_COOKIE)
+    check("[14] 串未变化 → 返回 False（跳过写回）", wrote_same is False, repr(wrote_same))
+    check("[14] 串未变化 → 文件逐字节未动", open(cfg, "rb").read() == before, "")
+
+    changed = NEW_COOKIE + "; extra=1"
+    wrote_new = tool.apply_refreshed_cookie(cfg, changed)
+    check("[14] 串有变化 → 返回 True（已落盘）", wrote_new is True, repr(wrote_new))
+    check("[14] 串有变化 → 回读即为新值", cookie_store.read_cookie_auth(cfg) == changed, "")
+    check("[14] 串有变化 → 仍只改 auth 行（行数不变）",
+          len(open(cfg, "rb").read().splitlines(keepends=True)) == len(before.splitlines(keepends=True)),
+          "")
+
+    dry_before = open(cfg, "rb").read()
+    wrote_dry = tool.apply_refreshed_cookie(cfg, changed + "; dry=1", dry_run=True)
+    check("[14] dry_run → 返回 False 且一个字节都没落盘",
+          wrote_dry is False and open(cfg, "rb").read() == dry_before, "")
+    check("[14] dry_run 后回读仍是原值", cookie_store.read_cookie_auth(cfg) == changed, "")
+
+    # 写后复验必须真的会拦：打桩让回读撒谎 → 必须抛
+    real_read = cookie_store.read_cookie_auth
+    raised = False
+    cookie_store.read_cookie_auth = lambda _p: "TAMPERED"
+    try:
+        tool.apply_refreshed_cookie(cfg, "yet=another|value==x")
+    except cookie_store.CookieWriteVerificationError:
+        raised = True
+    except Exception as e:
+        check("[14] 写后复验不一致 → 抛 CookieWriteVerificationError", False,
+              "实际抛出 %s: %s" % (type(e).__name__, e))
+    finally:
+        cookie_store.read_cookie_auth = real_read
+    check("[14] 写后复验不一致 → 抛（复验真的会拦，不是装饰）", raised, "未抛出（守卫失效）")
+
+
+# ---------------------------------------------------------------------------
+# [15] --login / --refresh 的就地 check 可注入（离线验证告警路径）
+# ---------------------------------------------------------------------------
+def test_login_refresh_alert_path_offline():
+    print("\n[15] --refresh / --login 的就地 check 可注入（离线验证告警路径）")
+    tmp = _workdir()
+    cfg = _write_text(os.path.join(tmp, "flow.yaml"), _sanitized_real_text())
+    state = os.path.join(tmp, "state.json")
+
+    real_browser = tool._browser_cookie_string
+    fake_browser = lambda headless, timeout_s, settle_ms: (NEW_COOKIE, "")  # noqa: E731
+    try:
+        tool._browser_cookie_string = fake_browser
+        rec = _Recorder()
+        rc = tool.do_refresh(config_path=cfg, state_path=state,
+                             fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=rec)
+    finally:
+        tool._browser_cookie_string = real_browser
+
+    check("[15] --refresh 拿到 cookie 且校验 401 → rc==2", rc == 2, "rc=%r" % (rc,))
+    check("[15] --refresh 的失败走了**注入的** notifier（1 次告警）", len(rec.messages) == 1,
+          "n=%d" % len(rec.messages))
+    check("[15] 注入的 state_path 被真实使用（state=auth_failed）",
+          json.load(open(state, encoding="utf-8")).get("status") == "auth_failed", "")
+    check("[15] --refresh 已把新 cookie 写回（回读一致）",
+          cookie_store.read_cookie_auth(cfg) == NEW_COOKIE, "")
+
+    before = open(cfg, "rb").read()
+    try:
+        tool._browser_cookie_string = fake_browser
+        rec2 = _Recorder()
+        rc2 = tool.do_refresh(config_path=cfg, state_path=state,
+                              fetcher=_FakeFetcher(200, _ok_body()), notifier=rec2)
+    finally:
+        tool._browser_cookie_string = real_browser
+    check("[15] 第二次同值 → rc==0", rc2 == 0, "rc=%r" % (rc2,))
+    check("[15] 第二次同值 → 文件字节未变（跳过写回）", open(cfg, "rb").read() == before, "")
+    check("[15] auth_failed → ok → 发恢复通知 1 次", len(rec2.messages) == 1,
+          "n=%d" % len(rec2.messages))
+
+    # --login 走同一条公共流程：假浏览器返回空串 → 必须是 2（未完成扫码登录），且不发通知
+    try:
+        tool._browser_cookie_string = lambda headless, timeout_s, settle_ms: (None, "超时")
+        rec3 = _Recorder()
+        rc3 = tool.do_login(config_path=cfg, state_path=state, fetcher=_FakeFetcher(200, _ok_body()),
+                            notifier=rec3)
+    finally:
+        tool._browser_cookie_string = real_browser
+    check("[15] --login 未拿到 cookie → rc==2", rc3 == 2, "rc=%r" % (rc3,))
+    check("[15] --login 未拿到 cookie → 不误发通知", rec3.messages == [], "n=%d" % len(rec3.messages))
 
 
 def main():
@@ -632,6 +800,8 @@ def main():
     test_transport_error()
     test_dry_run()
     test_state_path_ignored()
+    test_refresh_write_decision()
+    test_login_refresh_alert_path_offline()
     test_real_config_untouched()
 
     print("=" * 70)

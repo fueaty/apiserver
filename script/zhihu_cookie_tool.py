@@ -406,7 +406,35 @@ def _write_back(config_path, cookie_str):
              config_path, redact(cookie_str), backup_path)
 
 
-def run_browser_flow(config_path, headless, timeout_s, settle_ms, dry_run, manual_hint):
+def apply_refreshed_cookie(config_path, cookie_str, dry_run=False):
+    """续期写回：**只在序列化后的 cookie 串真的变化时**改写 `cookie.auth`，写后回读复验。
+
+    返回 True 表示确实落盘，False 表示磁盘上已是同值（跳过写入）。
+
+    单独抽成函数是为了让「只在变化时写回 + 写后复验」这条 --refresh 的核心语义
+    能在**没有浏览器**的环境里被直接验证（浏览器只是取 cookie 的手段）。
+    """
+    current = cookie_store.read_cookie_auth(config_path)  # 失败由调用方映射退出码
+    if cookie_str == current:
+        LOG.info("与磁盘上的 cookie.auth 一致（%s），跳过写回", redact(cookie_str))
+        return False
+
+    LOG.info("cookie 有变化：磁盘 %s → 浏览器 %s", redact(current), redact(cookie_str))
+    if dry_run:
+        LOG.info("[dry-run] 不写回 %s", config_path)
+        return False
+
+    _write_back(config_path, cookie_str)
+    readback = cookie_store.read_cookie_auth(config_path)
+    if readback != cookie_str:
+        raise cookie_store.CookieWriteVerificationError(
+            "写回后回读不一致：磁盘 %s vs 浏览器 %s" % (redact(readback), redact(cookie_str)))
+    LOG.info("写回后回读一致，续期落盘确认")
+    return True
+
+
+def run_browser_flow(config_path, headless, timeout_s, settle_ms, dry_run, manual_hint,
+                     state_path=None, fetcher=None, notifier=None):
     """--login / --refresh 的公共流程。返回退出码。"""
     try:
         cookie_str, error = _browser_cookie_string(headless, timeout_s, settle_ms)
@@ -425,23 +453,26 @@ def run_browser_flow(config_path, headless, timeout_s, settle_ms, dry_run, manua
     LOG.info("浏览器 cookie jar 序列化完成 %s", redact(cookie_str))
 
     if dry_run:
-        LOG.info("[dry-run] 不写回 %s，也不发通知", config_path)
-        return EXIT_OK
+        LOG.info("[dry-run] 不写回 %s；仍做一次只读校验（不落状态文件、不发通知）", config_path)
+    else:
+        _write_back(config_path, cookie_str)
+    # 退出码以「就地跑一次 check」为准：写回去不等于登录态真的可用
+    return check(config_path=config_path, state_path=state_path, fetcher=fetcher,
+                 notifier=notifier, dry_run=dry_run)
 
-    _write_back(config_path, cookie_str)
-    return check(config_path=config_path)
 
-
-def do_login(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S):
+def do_login(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S,
+             state_path=None, fetcher=None, notifier=None):
     """有头浏览器扫码登录一次，写回 cookie.auth，并立刻跑一次 check。"""
     config_path = config_path or DEFAULT_CONFIG
     LOG.info("有头浏览器启动，请在窗口里扫码登录知乎（profile=%s，超时 %ds）", PROFILE_DIR, timeout_s)
     return run_browser_flow(
         config_path, headless=False, timeout_s=timeout_s, settle_ms=0, dry_run=dry_run,
-        manual_hint="未完成扫码登录")
+        manual_hint="未完成扫码登录", state_path=state_path, fetcher=fetcher, notifier=notifier)
 
 
-def do_refresh(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S):
+def do_refresh(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S,
+               state_path=None, fetcher=None, notifier=None):
     """无头复用持久化 profile 续期；cookie 真的变了才写回，写后回读校验，再跑 check。"""
     config_path = config_path or DEFAULT_CONFIG
     LOG.info("无头浏览器续期（profile=%s，settle=%dms，超时 %ds）",
@@ -463,32 +494,19 @@ def do_refresh(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S):
 
     LOG.info("浏览器 cookie jar 序列化完成 %s", redact(cookie_str))
 
+    write_error = ""
     try:
-        current = cookie_store.read_cookie_auth(config_path)
-    except cookie_store.CookieConfigError as e:
-        LOG.error("读取当前 cookie.auth 失败：%s", e)
+        apply_refreshed_cookie(config_path, cookie_str, dry_run=dry_run)
+    except (cookie_store.CookieWriteError, cookie_store.CookieConfigError) as e:
+        write_error = "%s: %s" % (type(e).__name__, e)
+        LOG.error("续期写回失败：%s", write_error)
+
+    # 无论写回是否成功都要跑 check：凭证若确实不可用，告警必须发出去
+    result = check(config_path=config_path, state_path=state_path, fetcher=fetcher,
+                   notifier=notifier, dry_run=dry_run)
+    if write_error and result == EXIT_OK:
+        LOG.error("写回未成功但校验通过（%s）：本次凭证仍可用，故不告警，但续期并未落盘", write_error)
         return EXIT_ERROR
-
-    if cookie_str == current:
-        LOG.info("与磁盘上的 cookie.auth 一致（%s），跳过写回", redact(cookie_str))
-    else:
-        LOG.info("cookie 有变化：磁盘 %s → 浏览器 %s", redact(current), redact(cookie_str))
-        if dry_run:
-            LOG.info("[dry-run] 不写回 %s", config_path)
-        else:
-            _write_back(config_path, cookie_str)
-            try:
-                readback = cookie_store.read_cookie_auth(config_path)
-            except cookie_store.CookieConfigError as e:
-                LOG.error("写回后回读失败：%s", e)
-                return EXIT_ERROR
-            if readback != cookie_str:
-                LOG.error("写回后回读不一致：磁盘 %s vs 浏览器 %s",
-                          redact(readback), redact(cookie_str))
-                return EXIT_ERROR
-            LOG.info("写回后回读一致，续期落盘确认")
-
-    result = check(config_path=config_path, dry_run=dry_run)
     if result != EXIT_OK:
         LOG.error("续期后校验未通过（rc=%d）：需要人工执行 --login 扫码登录", result)
     return result
