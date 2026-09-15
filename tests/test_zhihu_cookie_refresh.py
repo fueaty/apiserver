@@ -2617,11 +2617,13 @@ def test_unreadable_state_keeps_obligation():
           state4 in blob4 and ("NotADirectoryError" in blob4 or "FileExistsError" in blob4
                                or "OSError" in blob4), blob4[-400:])
 
-    # ---- 场景 5b：真正的 OS 级读失败（状态路径是**目录** → PermissionError）----
+    # ---- 场景 5b：真正的 OS 级读失败（状态路径是**目录**）----
     # Windows 下「父路径被普通文件占位」在**读**这一步报的是 FileNotFoundError（等价于「没有
     # 那个文件」），所以我另造一个确定性的 OSError：把状态路径指向一个目录。这条锁住
     # 「打不开文件」这个分支本身：本工具只会往该路径写普通文件，所以那里不可能有它的记录
     # ⇒ 不公告（否则就是每次运行响一次的风暴），但仍然 rc=3 且日志响亮。
+    # 平台差异：open(目录) 在 Windows 报 PermissionError，在 Linux 报 IsADirectoryError
+    # （两者都是 OSError 子类，语义同为「路径打不开」），断言需同时接受。
     tmp6 = _workdir()
     dir_state = os.path.join(tmp6, "state_is_a_dir")
     os.makedirs(dir_state)
@@ -2636,7 +2638,8 @@ def test_unreadable_state_keeps_obligation():
         tool.LOG.removeHandler(handler6)
     blob6 = "\n".join(r.getMessage() for r in records6)
     check("[28] H1 场景自证：该状态路径确实打不开（目录），且是 OSError",
-          _read_state_probe(dir_state) == "PermissionError", _read_state_probe(dir_state))
+          _read_state_probe(dir_state) in ("PermissionError", "IsADirectoryError"),
+          _read_state_probe(dir_state))
     check("[28] H1 读不动（OS 级）+ 写不进去 → rc==3 且不抛异常",
           c8 is None and r8 == 3, "rc=%r crash=%s" % (r8, c8))
     check("[28] H1 读不动（OS 级）→ 不合成公告（该路径上不可能有本工具写的记录 = 没有义务，"
@@ -2644,7 +2647,8 @@ def test_unreadable_state_keeps_obligation():
           rec6.messages == [] and _unreadable_marker_lines(records6) == [],
           "n=%d" % len(rec6.messages))
     check("[28] H1 读不动（OS 级）仍然响亮：日志点名路径与 OS 错误，并走 StateWriteError 降级",
-          dir_state in blob6 and "PermissionError" in blob6 and "状态文件不可用" in blob6,
+          dir_state in blob6 and ("PermissionError" in blob6 or "IsADirectoryError" in blob6)
+          and "状态文件不可用" in blob6,
           blob6[-400:])
 
     # ---- 场景 6：读不动 **且** 本次判定 auth_failed → 转换公告与「可能丢告警」必须都在 ----
