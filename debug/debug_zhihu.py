@@ -8,15 +8,17 @@ import sys
 import os
 import yaml
 
-# 添加项目根目录到Python路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# 项目根目录 = debug/ 的上一级。旧版误插 debug/ 自身目录，
+# 导致 `from app...` 找不到包（debug/ 下没有 app/）。
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 from app.services.collection.sites.zhihu import ZhihuSite
 
 
 async def load_site_configs():
-    """加载站点配置"""
-    config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config', 'sites.yaml')
+    """加载站点配置（项目根下的 config/sites.yaml；旧版误找 debug/config/sites.yaml）"""
+    config_path = os.path.join(PROJECT_ROOT, 'config', 'sites.yaml')
     with open(config_path, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
 

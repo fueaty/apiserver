@@ -113,6 +113,11 @@ class XinhuaSite(BaseSite):
                     # 过滤无效标题
                     if not title or len(title) < 6 or len(title) > 100:
                         continue
+                    
+                    # 过滤明显截断的标题（以冒号结尾）：新华首页专题卡片的引题
+                    # 常以「武汉昙华林：」形式出现（主标题在图片上取不到）
+                    if title.rstrip().endswith(('：', ':')):
+                        continue
                         
                     # 过滤特定无用链接
                     if any(keyword in url for keyword in ['javascript:', 'mailto:', '.js', '.css', '.png', '.jpg']):

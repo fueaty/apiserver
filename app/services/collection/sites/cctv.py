@@ -73,6 +73,7 @@ class CctvSite(BaseSite):
         import re
         
         hot_data = []
+        seen_urls = set()  # 同一篇文章的「标题链接/图片链接」只保留第一条（后者常取到正文句子）
         
         try:
             soup = BeautifulSoup(html_text, 'html.parser')
@@ -81,7 +82,10 @@ class CctvSite(BaseSite):
             # 查找包含新闻链接的元素
             news_items = soup.find_all(['a'], href=re.compile(r'.*\.shtml'))
             
-            for i, item in enumerate(news_items[:50]):  # 限制最多50条
+            # 预筛上限 200（非容量上界——终截断由 unique_data[:_MAX] 把守）：
+            # 央视首页 .shtml 链接中栏目入口/专题入口占大头，预筛 50 时
+            # 过滤后仅剩个位数真新闻（2026-09 实测 6 条）
+            for i, item in enumerate(news_items[:200]):  # 限制最多200条
                 try:
                     # 提取标题
                     title = item.get_text().strip()
@@ -89,9 +93,22 @@ class CctvSite(BaseSite):
                     # 提取链接
                     url = item.get('href', '')
                     
+                    # 过滤栏目入口页（index.shtml）：其链接文本是栏目名
+                    # （如“央视快评”“小央画话”），不是新闻标题
+                    # （2026-09 巡检：22 条中 13 条为栏目名）
+                    if 'index.shtml' in url:
+                        continue
+                    
                     # 过滤无效标题
                     if not title or len(title) < 4 or 'href' in title:
                         continue
+                    
+                    # URL 去重：同一篇文章只保留第一个通过过滤的链接
+                    # （央视首页同一文章常有标题链接+图片链接两个入口，
+                    #   图片链接的 get_text() 会取到正文首句）
+                    if url in seen_urls:
+                        continue
+                    seen_urls.add(url)
                     
                     # 简单热度计算（基于标题长度）
                     hot_score = str(len(title) * 10)
@@ -105,7 +122,7 @@ class CctvSite(BaseSite):
                         'title': title,
                         'url': url,
                         'hot': hot_score,
-                        'rank': str(i+1),
+                        'rank': str(len(hot_data) + 1),
                         'published_at': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         'collected_at': self._get_current_time(),
                         'site_code': self.site_code,

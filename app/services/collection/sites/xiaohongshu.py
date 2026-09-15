@@ -263,13 +263,11 @@ class XiaohongshuSite(BaseSite):
                         user_info = note_card.get('user', {})
                         user_name = user_info.get('nickname', '').strip()
                         
-                        # 构造完整标题
-                        if user_name and title:
-                            full_title = f"{title} by {user_name}"
-                        elif title:
-                            full_title = title
-                        else:
+                        # 构造完整标题（保持纯净：作者不拼入标题。
+                        # 旧版 “{title} by {作者}” 污染 title 字段，见 2026-09 数据质量巡检）
+                        if not title:
                             continue
+                        full_title = title
                         
                         # 获取笔记ID和链接
                         note_id = (note_card.get('noteId') or 
@@ -336,42 +334,8 @@ class XiaohongshuSite(BaseSite):
                         
                         # 过滤常见无意义内容
                         invalid_keywords = ['首页', '关注', '发现', '商城', '登录', '注册', '下载', 'APP', '消息', '我',
-                                          'ICP', '沪公网安备', '营业执照', '沪ICP备', '网络文化经营许可证']
+                                      'ICP', '沪公网安备', '营业执照', '沪ICP备', '网络文化经营许可证']
                         if any(keyword in full_title for keyword in invalid_keywords):
-                            continue
-                        
-                        # 只采集高热度帖子 - 热度大于100或包含"万"
-                        hot_value = 0
-                        hot_text = liked_count
-                        if '万' in hot_text:
-                            # 处理"万"单位
-                            try:
-                                hot_value = float(hot_text.replace('万+', '').replace('万', '')) * 10000
-                            except ValueError:
-                                hot_value = 10000  # 如果无法解析，默认为10000
-                        elif hot_text.isdigit():
-                            hot_value = int(hot_text)
-                        else:
-                            # 处理"1千+"这类情况
-                            if '千+' in hot_text:
-                                hot_value = 1000
-                            elif '万+' in hot_text:
-                                hot_value = 10000
-                            # 处理"1千"到"9千"的情况
-                            elif '千' in hot_text:
-                                try:
-                                    hot_value = int(hot_text.replace('千', '')) * 1000
-                                except ValueError:
-                                    hot_value = 1000
-                            else:
-                                # 尝试直接转换为整数
-                                try:
-                                    hot_value = int(hot_text)
-                                except ValueError:
-                                    hot_value = 0
-                        
-                        # 只保留热度大于100的帖子（为了测试能获取到一些数据）
-                        if hot_value < 100:
                             continue
                         
                         # 标题去重检查
@@ -381,8 +345,10 @@ class XiaohongshuSite(BaseSite):
                         hot_data.append({
                             'title': full_title,
                             'url': url,
-                            'hot': liked_count,
-                            'rank': str(i + 1)
+                            # 输出数值化热度（上面已把 “2.9万/1.3千” 等统一换算为整数；
+                            # 旧版误存原始字符串 liked_count，导致 hot 格式混杂不可比较）
+                            'hot': str(hot_value),
+                            'rank': str(len(hot_data) + 1)
                         })
                         
                     except Exception as inner_e:
@@ -630,13 +596,10 @@ class XiaohongshuSite(BaseSite):
                     if author_elem:
                         author = author_elem.get_text(strip=True)
                     
-                    # 构造完整标题
-                    if author and title:
-                        full_title = f"{title} by {author}"
-                    elif title:
-                        full_title = title
-                    else:
+                    # 构造完整标题（保持纯净：作者不拼入标题，与 JSON 分支一致）
+                    if not title:
                         continue
+                    full_title = title
                     
                     # 过滤无效标题
                     if not full_title or len(full_title) < 2 or len(full_title) > 100:

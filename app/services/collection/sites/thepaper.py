@@ -74,16 +74,26 @@ class ThepaperSite(BaseSite):
             
             session = await self.get_session()
             
-            # 首先访问澎湃新闻主页获取推荐内容
-            url = "https://www.thepaper.cn/"
-            async with session.get(url, headers=headers, timeout=20) as response:
-                if response.status == 200:
-                    text = await response.text()
-                    # 使用专门的热榜解析方法
-                    homepage_results = self._parse_thepaper_hot_ranking(text)
-                    results.extend(homepage_results)
-                else:
-                    print(f"澎湃新闻主页请求失败，状态码: {response.status}")
+            # ── 热榜来源 1（首选）：官方热榜 API —— 真实热榜顺序 + 真实互动热度 ──
+            # 2026-09 巡检：下方“首页 HTML 解析”三条路径（__NEXT_DATA__ JSON、
+            # carousel 等 hash 类名选择器、页面元素兜底）已全部失效（类名 hash
+            # 轮换 + 结构变更），旧版每轮热榜 0 条、全靠分类页补量，hot/rank
+            # 均为公式伪造。此 API 是澎湃首页自身在用的数据源，失败时自动落回旧路径。
+            api_results = await self._fetch_hot_ranking_via_api(session)
+            results.extend(api_results)
+            
+            # ── 热榜来源 2（降级）：首页 HTML 解析（API 不可用时，行为同旧版）──
+            if not api_results:
+                # 首先访问澎湃新闻主页获取推荐内容
+                url = "https://www.thepaper.cn/"
+                async with session.get(url, headers=headers, timeout=20) as response:
+                    if response.status == 200:
+                        text = await response.text()
+                        # 使用专门的热榜解析方法
+                        homepage_results = self._parse_thepaper_hot_ranking(text)
+                        results.extend(homepage_results)
+                    else:
+                        print(f"澎湃新闻主页请求失败，状态码: {response.status}")
             
             # 然后访问各个分类页面获取更多内容
             category_results = []
@@ -108,20 +118,27 @@ class ThepaperSite(BaseSite):
                 except Exception:
                     continue  # 忽略分类页面访问异常
             
-            # 合并主页和分类页面的结果
+            # 合并热榜和分类页面的结果
             results.extend(category_results)
             
             # 去重处理
             if results:
                 results = self._deduplicate_hot_data(results)
-                
-                # 按热度排序
-                results.sort(key=lambda x: int(x.get('hot', 0)), reverse=True)
-                # 确保每个项目都有正确的排名
-                for i, item in enumerate(results, 1):
-                    item['rank'] = str(i)
-                    # 动态调整热度值，确保排名高的新闻热度更高
-                    item['hot'] = str(max(50000, int(item['hot']), 200000 - (i - 1) * 500))
+                if api_results:
+                    # 真热榜：API 顺序即排名；保留真实互动热度，不用公式重算
+                    # （旧版 max(50000, ..., 200000-(i-1)*500) 会把真实热度覆盖成
+                    #   伪造值，且分类页的公式热度会压过真热榜导致其沉底）
+                    for i, item in enumerate(results, 1):
+                        item['rank'] = str(i)
+                else:
+                    # 降级路径：按热度排序 + 公式热度（旧行为）
+                    # 按热度排序
+                    results.sort(key=lambda x: int(x.get('hot', 0)), reverse=True)
+                    # 确保每个项目都有正确的排名
+                    for i, item in enumerate(results, 1):
+                        item['rank'] = str(i)
+                        # 动态调整热度值，确保排名高的新闻热度更高
+                        item['hot'] = str(max(50000, int(item['hot']), 200000 - (i - 1) * 500))
                 # 限制返回最多 MAX_RESULTS 条数据（容量约束，见模块顶部 MAX_RESULTS）
                 results = results[:MAX_RESULTS]
                     
@@ -149,6 +166,62 @@ class ThepaperSite(BaseSite):
         #    返回前都做了这层包装，thepaper 此前**漏了它** → 采集到 100 条却「入库 0 条」
         #    （被静默丢弃，无任何日志）。顺序：先按 MAX_RESULTS 截断，再逐条包装（幂等）。
         return [{"fields": item} for item in results[:MAX_RESULTS]]
+    
+    # 澎湃首页右侧「热榜」的官方数据接口（返回 JSON，data.hotNews 为真实热榜 20 条，
+    # 含 praiseTimes/interactionNum/publishTime）。
+    HOT_RANK_API = "https://cache.thepaper.cn/contentapi/wwwIndex/rightSidebar"
+    
+    async def _fetch_hot_ranking_via_api(self, session) -> List[Dict[str, Any]]:
+        """通过官方热榜 API 获取澎湃真实热榜（首选热榜来源）。
+        
+        Returns:
+            热榜记录列表；任何失败（网络/非 200/无 hotNews 字段）一律返回 []，
+            由调用方落回「首页 HTML 解析」旧路径。
+        """
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json',
+            'Referer': 'https://www.thepaper.cn/',
+        }
+        try:
+            async with session.get(self.HOT_RANK_API, headers=headers, timeout=10) as response:
+                if response.status != 200:
+                    print(f"澎湃热榜 API 请求失败，状态码: {response.status}，落回首页解析")
+                    return []
+                data = await response.json()
+            hot_news = (data.get('data') or {}).get('hotNews') or []
+            if not hot_news:
+                print("澎湃热榜 API 返回无 hotNews 数据，落回首页解析")
+                return []
+            
+            results = []
+            for i, item in enumerate(hot_news[:50], 1):
+                title = (item.get('name') or '').strip()
+                cont_id = item.get('contId') or ''
+                if not title or not cont_id:
+                    continue
+                # 真实互动热度：点赞×10 + 互动×5（沿用旧版公式，此前从未拿到过真实数据）
+                praise = int(item.get('praiseTimes') or 0)
+                interaction = int(item.get('interactionNum') or 0)
+                results.append({
+                    'id': generate_content_id(),
+                    'title': title,
+                    'url': f"https://www.thepaper.cn/newsDetail_forward_{cont_id}",
+                    'hot': str(praise * 10 + interaction * 5),
+                    'rank': str(i),
+                    'published_at': item.get('publishTime') or self._get_current_time(),
+                    'collected_at': self._get_current_time(),
+                    'site_code': self.site_code,
+                    'category': '热榜',
+                    'content': '',
+                    'author': '澎湃新闻',
+                    'status': 'collected'
+                })
+            print(f"澎湃热榜 API 获取到 {len(results)} 条真实热榜")
+            return results
+        except Exception as e:
+            print(f"澎湃热榜 API 调用失败: {e}，落回首页解析")
+            return []
     
     def _parse_category_page(self, html_text: str, category_url: str) -> List[Dict[str, Any]]:
         """解析澎湃新闻分类页面内容"""
