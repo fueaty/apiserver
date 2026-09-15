@@ -15,6 +15,14 @@
 #   python3 script/zhihu_cookie_tool.py --login
 # 扫码后 profile 重新可用，后续 cron 又会自动续期。
 #
+# ⚠️ 上面这句现在**由代码构造保证**（do_refresh 的「拿不到 cookie」分支会就地跑一次 check），
+#    精确语义是：
+#      · `config/zhihu.yaml` 里的凭证确实失效（401）→ rc=2 + 企微告警；
+#      · 凭证其实还有效（profile 空但 cookie 未过期）→ rc=3，**不告警**（采集尚未断流，
+#        报 2 会给出「请扫码」的假指引）；此时靠日志里的 rc=3 暴露，等 cookie 真过期那一次
+#        再由 401 升级成 rc=2 + 告警；
+#      · 同一类别**反复出现不重复告警**（状态机只在类别变化时响铃），所以别指望每天都收到推送。
+#
 # ⚠️ 不要写死部署路径 / 不要用裸 python
 # 本脚本用 BASH_SOURCE 自定位根目录，因此 /root/apiserver 与 /opt/apiserver
 # 两种部署都能直接跑，不依赖 `ln -s /opt/apiserver /root/apiserver` 这条兼容软链。

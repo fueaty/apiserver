@@ -21,20 +21,25 @@
   2 = 认证失败      401（code 101/100）**或** `cookie.auth` 缺失/为空
   3 = 其它一切      传输失败 / 响应体无法解析 / **任何其它非 200 状态（403/429/500/302…）**
                     / 状态文件不可用（父路径被普通文件占位、权限不足…）
-                    / **浏览器或运行环境不可用**（playwright 缺失、chromium 未安装或装坏、
-                      驱动启动失败……即 --login/--refresh 根本拿不到 cookie 的那类故障）
+                    / **续期没能拿到 cookie**，即
+                      · 浏览器或运行环境不可用（playwright 缺失、chromium 未安装或装坏、
+                        驱动启动失败），或
+                      · 浏览器正常但持久化 profile 里**没有有效 z_c0**（cookie 已过期），
+                        而与此同时 `config/zhihu.yaml` 里的凭证**仍然可用**（校验 rc=0）
 仅**类别变化**时告警：ok→非ok 一定响铃（含 403/429 风控——它意味着采集已被静默阻断），
 →ok 发恢复通知，同一类别反复出现不重复告警。
 
-⚠️ rc=3 里的「浏览器/运行环境不可用」有一条**刻意的例外**：--login / --refresh 遇到这种
-故障时**不会**直接返回 3 了事，而是**仍然就地跑一次 check()**（探测凭证 → 需要时告警 →
-落状态文件），只有 check() 判定凭证失效才返回 2（要人工扫码），否则才返回 3。
-理由：若浏览器故障直接短路成 rc=3，就同时短路掉了认证探测、告警与状态落盘 —— cron 里
-MAILTO="" 且只写日志文件，于是「续期每天静默 rc=3」与「cookie 悄悄过期、zhihu 静默 0 条」
-会同时发生而无人察觉。这正是 weibo 站点已经真实发生过的静默降级
-（`BrowserType.launch: Executable doesn't exist at .../chrome-headless-shell`，被裸 print
-吞掉数月无人发现）；本工具的存在意义就是让这类故障响铃，绝不能自己犯同一个病。
-见 _check_after_browser_failure()。
+⚠️ 上一条 rc=3 有一个**刻意的例外**：--refresh 遇到「续期没拿到 cookie」时**不会**直接返回 3
+了事，而是**仍然就地跑一次 check()**（探测凭证 → 需要时告警 → 落状态文件），只有 check()
+判定凭证失效才返回 2（要人工扫码），否则才返回 3。
+理由：若直接短路，就同时短路掉了认证探测、告警与状态落盘 —— cron 里 MAILTO="" 且只写日志
+文件，于是「续期每天静默非 0」与「cookie 悄悄过期、zhihu 静默 0 条」会同时发生而无人察觉。
+这正是 weibo 站点已经真实发生过的静默降级（`BrowserType.launch: Executable doesn't exist
+at .../chrome-headless-shell`，被裸 print 吞掉数月无人发现）；本工具的存在意义就是让这类
+故障响铃，绝不能自己犯同一个病。见 _probe_after_renewal_failure()。
+
+⚠️ --login **不走**这条例外（同一个「没拿到 cookie」条件在交互路径上直接返回 2）：人就在
+现场扫码，再推一条「请扫码」的告警是假告警。这条分叉是刻意的，见 run_browser_flow 里的注释。
 
 告警投递是**持久化义务**（本工具的立身之本就是「出事会响」）
 -----------------------------------------------------------------------------
@@ -766,41 +771,47 @@ def apply_refreshed_cookie(config_path, cookie_str, dry_run=False):
     return True
 
 
-def _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run):
-    """浏览器不可用时的**兜底校验**：rc 契约不变，但告警义务一条都不许丢。
+def _probe_after_renewal_failure(config_path, state_path, fetcher, notifier, dry_run, reason):
+    """续期流程**在拿到 cookie 之前就失败**时的兜底探测：rc 契约不变，但告警义务一条都不许丢。
 
-    --login / --refresh 只要浏览器拿不到 cookie（playwright 不可导入 / chromium 装坏 /
-    驱动启动失败）就走这里。从前这两个失败分支直接 `return EXIT_ERROR` —— 于是「浏览器坏了」
+    适用两条形态（都用 reason 如实描述，日志绝不与事实不符）：
+      · 浏览器/运行环境不可用：playwright 不可导入 / chromium 装坏 / 驱动启动失败；
+      · 浏览器正常但 profile 里**没有有效 z_c0**（= cookie 真的过期）。
+
+    从前这几条分支都是直接 `return EXIT_ERROR` / `return EXIT_AUTH` —— 于是「续期没做成」
     同时意味着「不做认证探测、不写状态文件、不发告警」，只剩一行日志。而本工具的 cron 调用点
-    `MAILTO=""` 且只写日志文件 ⇒ 续期每天静默 rc=3 的同时，cookie 在同一时间悄悄过期、
+    `MAILTO=""` 且只写日志文件 ⇒ 续期每天静默非 0 的同时，cookie 在同一时间悄悄过期、
     zhihu 静默 0 条入库，几个月没人发现。这等于把 weibo 站点已经真实发生过的静默降级
     （`BrowserType.launch: Executable doesn't exist at .../chrome-headless-shell`，被裸 print
     吞掉）移植进了「为消灭静默失败而造」的这个工具里。
 
-    所以浏览器失败也要用**完全相同的** config/state/fetcher/notifier/dry_run 跑一次 check()，
+    所以这里用**完全相同的** config/state/fetcher/notifier/dry_run 跑一次 check()，
     借它的副作用去探测凭证、在凭证不可用时把告警发出去、并把状态落盘，然后：
 
       · check() == EXIT_AUTH → 凭证确实失效，告警已经发出 ⇒ 返回 EXIT_AUTH（要人工扫码）；
       · 否则（包括 check() 判成 ok 的情形）→ 续期确实没做成 ⇒ 返回 EXIT_ERROR。
-        「凭证仍可用就不告警」是刻意的：浏览器故障本身不需要人扫码，把它做成每次都响的
-        误报机器，运维很快就会把本工具的告警当成噪声。
+        「凭证仍可用就不告警」是刻意的：此时采集**还没断**，报 2 会让 wrapper 打出
+        「凭证仍不可用、需要人工扫码」这种**假指引**，还会诱发假告警；持续静默降级由 rc=3
+        + 状态文件暴露，等 cookie 真的过期那一次再由 check() 的 401 升级成 rc=2 + 告警。
 
     check() 自身抛异常也兜住：rc 永远只落在 {0,2,3}，绝不因为这里变成 rc=1 + traceback ——
     那个 rc 既没落状态文件也没发告警，是比 rc=3 更糟的失效形态。
     """
+    LOG.error("续期未拿到 cookie（%s）：仍就地跑一次 check 探测凭证可用性 —— 凭证若确实已失效，"
+              "告警必须发出去（否则 cron 下只剩一行日志，cookie 过期无人知道）", reason)
     try:
         result = check(config_path=config_path, state_path=state_path, fetcher=fetcher,
                        notifier=notifier, dry_run=dry_run)
     except Exception as e:
-        LOG.error("浏览器不可用后的兜底 check 抛出未预期异常（%s: %s）；本次按 rc=%d 处理",
-                  type(e).__name__, e, EXIT_ERROR)
+        LOG.error("续期失败（%s）后的兜底 check 抛出未预期异常（%s: %s）；本次按 rc=%d 处理",
+                  reason, type(e).__name__, e, EXIT_ERROR)
         return EXIT_ERROR
     if result == EXIT_AUTH:
-        LOG.error("浏览器不可用，且兜底 check 判定凭证失效（rc=%d）：告警已发出，"
-                  "需要人工执行 --login 扫码登录", EXIT_AUTH)
+        LOG.error("续期失败（%s），且兜底 check 判定凭证确实失效（rc=%d）：告警已发出，"
+                  "需要人工执行 --login 扫码登录", reason, EXIT_AUTH)
         return EXIT_AUTH
-    LOG.error("浏览器不可用，但兜底 check 未判定凭证失效（check rc=%s）；续期未完成，"
-              "本次按 rc=%d 处理", result, EXIT_ERROR)
+    LOG.error("续期失败（%s），但兜底 check 未判定凭证失效（check rc=%s）—— 采集尚未断流，"
+              "不上浮成 rc=2（避免假指引/假告警）；本次按 rc=%d 处理", reason, result, EXIT_ERROR)
     return EXIT_ERROR
 
 
@@ -813,12 +824,22 @@ def run_browser_flow(config_path, headless, timeout_s, settle_ms, dry_run, manua
         LOG.error("playwright 不可导入（%s）。--login/--refresh 需要 playwright + chromium；"
                   "--check 不需要浏览器。", e)
         # 浏览器不可用 ≠ 可以跳过认证探测：凭证若已失效，告警必须发出去（见函数 docstring）
-        return _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run)
+        return _probe_after_renewal_failure(
+            config_path, state_path, fetcher, notifier, dry_run,
+            reason="playwright 不可导入，无法驱动浏览器")
     except Exception as e:
         LOG.error("启动/驱动浏览器失败：%s: %s", type(e).__name__, e)
-        return _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run)
+        return _probe_after_renewal_failure(
+            config_path, state_path, fetcher, notifier, dry_run,
+            reason="启动/驱动浏览器失败（%s）" % type(e).__name__)
 
     if not cookie_str:
+        # ⚠️ 这条分支**刻意**与 do_refresh 的同名分支分叉，不要在重构时「顺手统一」：
+        # · --login 是**交互路径**：人就在现场准备扫码，再推一条「请扫码」的企微告警纯属噪声，
+        #   而且会把「一次正常的人工登录」变成一次假告警（tests [15] 与 [31-L9] 故意锁住了
+        #   「不误发通知、也不为它跑 check」）；
+        # · --refresh 走 cron **无人值守**，同一个条件（profile 里没有有效 z_c0）意味着
+        #   cookie 真的过期 ⇒ 必须响铃，所以那边会调 _probe_after_renewal_failure（见 do_refresh）。
         LOG.error("%s。%s", error, manual_hint)
         return EXIT_AUTH
 
@@ -856,14 +877,27 @@ def do_refresh(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S,
     except ImportError as e:
         LOG.error("playwright 不可导入（%s）。--refresh 需要 playwright + chromium。", e)
         # 浏览器不可用 ≠ 可以跳过认证探测：凭证若已失效，告警必须发出去（见函数 docstring）
-        return _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run)
+        return _probe_after_renewal_failure(
+            config_path, state_path, fetcher, notifier, dry_run,
+            reason="playwright 不可导入，无法驱动浏览器")
     except Exception as e:
         LOG.error("启动/驱动浏览器失败：%s: %s", type(e).__name__, e)
-        return _check_after_browser_failure(config_path, state_path, fetcher, notifier, dry_run)
+        return _probe_after_renewal_failure(
+            config_path, state_path, fetcher, notifier, dry_run,
+            reason="启动/驱动浏览器失败（%s）" % type(e).__name__)
 
     if not cookie_str:
         LOG.error("%s。持久化 profile 已失效，需要人工执行 --login 重新扫码登录", error)
-        return EXIT_AUTH
+        # ⚠️ 这条分支**不能**像 run_browser_flow 那样直接 `return EXIT_AUTH`：--refresh 由 cron
+        # 无人值守调用，而「profile 里没有有效 z_c0」= **cookie 真的过期** —— 正是本工具最想抓
+        # 的那种生产失效。旧的直接返回只剩一行日志（cron MAILTO="" ⇒ 等于静默），而
+        # script/zhihu_cookie_refresh.sh 头部注释早已宣称这里会走 --check 的告警路径。
+        # 所以仍然就地跑一次 check：凭证确实不可用才返回 2（且告警已发出）；若 config 里的
+        # 凭证其实还有效（profile 空但 cookie 未过期），返回 3 而不是 2，免得 wrapper 打出
+        # 「凭证仍不可用，需要人工扫码」这种**假指引**、并诱发假告警。
+        return _probe_after_renewal_failure(
+            config_path, state_path, fetcher, notifier, dry_run,
+            reason="持久化 profile 中无有效 z_c0（浏览器已正常返回）")
 
     LOG.info("浏览器 cookie jar 序列化完成 %s", redact(cookie_str))
 
@@ -875,7 +909,7 @@ def do_refresh(config_path=None, dry_run=False, timeout_s=LOGIN_TIMEOUT_S,
         LOG.error("续期写回失败：%s", write_error)
 
     # 无论写回是否成功都要跑 check：凭证若确实不可用，告警必须发出去
-    # （上面两个浏览器失败分支同样适用 —— 见 _check_after_browser_failure）
+    # （上面三条「续期没拿到 cookie」的失败分支同样适用 —— 见 _probe_after_renewal_failure）
     result = check(config_path=config_path, state_path=state_path, fetcher=fetcher,
                    notifier=notifier, dry_run=dry_run)
     if write_error and result == EXIT_OK:

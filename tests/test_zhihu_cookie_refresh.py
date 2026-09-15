@@ -35,6 +35,7 @@
 import hashlib
 import importlib.util
 import json
+import logging
 import os
 import re
 import shutil
@@ -1493,8 +1494,8 @@ def _browser_that_raises(exc):
     """返回一个「取 cookie 必将抛 exc」的替身。
 
     刻意抛**真的** ImportError/RuntimeError，而不是返回 `(None, "...")`：
-    本组要锁的正是 `_browser_cookie_string` 的 **except 分支**。「返回 (None, ...)」走的是
-    `if not cookie_str: return EXIT_AUTH` 那条**早已被 [15] 覆盖**的路径，与本次缺陷无关。
+    本组要锁的正是 `_browser_cookie_string` 的 **except 分支**（`[31]`）。
+    「返回 (None, ...)」走的是 `if not cookie_str` 那条分支 —— 它由 `[32]` 单独覆盖。
     传异常**类型**时每次调用新建实例（避免复用同一个 traceback 对象）。
     """
     def _raise(headless, timeout_s, settle_ms):
@@ -1502,6 +1503,15 @@ def _browser_that_raises(exc):
             raise exc("模拟浏览器/运行环境不可用")
         raise exc
     return _raise
+
+
+def _empty_profile(headless, timeout_s, settle_ms):
+    """浏览器**正常**跑完，但 profile 里没有有效 z_c0（= cookie 真的过期）。
+
+    这就是「profile 失效」这条生产主路径：`_browser_cookie_string` 不抛异常、只是拿不到
+    登录态，于是 `do_refresh` 走到 `if not cookie_str`。**不依赖本机是否装了 playwright**。
+    """
+    return None, "在 300s 内未检测到有效的 z_c0 cookie"
 
 
 def test_browser_failure_still_runs_check():
@@ -1624,6 +1634,143 @@ def test_browser_failure_still_runs_check():
         tool._browser_cookie_string = real_browser
     check("[31-L5] 兜底 check 自身抛异常 → 不崩（无 traceback 逃出）、rc==3",
           crash is None and rc == 3, "rc=%r crash=%s" % (rc, crash))
+
+
+# ---------------------------------------------------------------------------
+# [32] profile 里没有有效 z_c0（cookie 真的过期）→ do_refresh 也必须跑 check
+# ---------------------------------------------------------------------------
+def test_profile_empty_path_probes_check():
+    """[32] 与被修掉的两个 except 分支**同源**：`if not cookie_str` 曾经直接 `return EXIT_AUTH`。
+
+    于是「profile 失效」= **cookie 真的过期** —— 本工具最想抓的那种生产失效 —— 在 cron
+    （MAILTO=""、只写日志文件）下只剩一行日志；而 script/zhihu_cookie_refresh.sh 的头部注释
+    早已宣称这里会走 --check 的告警路径推送企微。
+
+    L6/L7 是同一条件的**两侧闸门**，缺一不可：
+      · L6 死凭证 ⇒ rc=2 + 告警必须发出（否则改了个寂寞）；
+      · L7 凭证仍有效 ⇒ rc=3 且**绝不**告警（否则 wrapper 会打出「凭证仍不可用、需要人工
+        扫码」的**假指引**，而且 profile 一空就天天推 —— 从静默机器变成误报机器）。
+    L9 锁住 --login 那条路径的**刻意分叉**（交互式：人在现场，不跑 check、不告警）。
+    L10 锁「日志不许与事实不符」：原因（reason）传错就会被抓。
+    """
+    print("\n[32] profile 空（cookie 真过期）→ do_refresh 仍跑 check"
+          "（L6 死凭证告警 / L7 有效凭证不误报 / L8 三条失败分支都到达 check / "
+          "L9 --login 刻意不跑 / L10 日志如实）")
+
+    real_browser = tool._browser_cookie_string
+
+    # --- L6：profile 空 + 死凭证 → rc==2、告警被尝试投递、状态落盘 ---
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "profile_empty_dead.yaml")
+    rec = _Recorder()
+    fetch = _FakeFetcher(401, BODY_CODE_100)
+    try:
+        tool._browser_cookie_string = _empty_profile
+        rc, crash = _call_catching(tool.do_refresh, config_path=cfg, state_path=state,
+                                   fetcher=fetch, notifier=rec)
+    finally:
+        tool._browser_cookie_string = real_browser
+    check("[32-L6] profile 空 + 死凭证 → 不崩、rc==2（cookie 真过期，需人工扫码）",
+          crash is None and rc == 2, "rc=%r crash=%s" % (rc, crash))
+    check("[32-L6] L8 profile 空也真到达了 check（注入 fetcher 恰好 1 次）",
+          fetch.calls == 1, "calls=%d" % fetch.calls)
+    check("[32-L6] 告警被**尝试投递**（注入 notifier 恰好 1 条）",
+          len(rec.messages) == 1, "n=%d" % len(rec.messages))
+    if rec.messages:
+        check("[32-L6] 告警文案含 code=100 与人工动作 --login",
+              "code=100" in rec.messages[0] and "--login" in rec.messages[0], rec.messages[0])
+        check("[32-L6] 告警不含 cookie 明文",
+              "DUMMY_COOKIE" not in rec.messages[0] and "z_c0=" not in rec.messages[0],
+              rec.messages[0])
+    _assert_state("[32-L6] 状态文件记下这次认证失败（status=auth_failed）",
+                  state, "status", "auth_failed")
+    _assert_state("[32-L6] 状态文件记的 code 是接口 code=100", state, "code", 100)
+
+    # --- L7：profile 空但 config 里的凭证仍有效 → rc==3，且**不许**告警 ---
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "profile_empty_alive.yaml")
+    rec = _Recorder()
+    fetch = _FakeFetcher(200, _ok_body())
+    try:
+        tool._browser_cookie_string = _empty_profile
+        rc, crash = _call_catching(tool.do_refresh, config_path=cfg, state_path=state,
+                                   fetcher=fetch, notifier=rec)
+    finally:
+        tool._browser_cookie_string = real_browser
+    check("[32-L7] profile 空 + 凭证仍有效 → 不崩、rc==3（绝不上浮成 2，免得假指引）",
+          crash is None and rc == 3, "rc=%r crash=%s" % (rc, crash))
+    check("[32-L7] L8 也真到达了 check（注入 fetcher 恰好 1 次）",
+          fetch.calls == 1, "calls=%d" % fetch.calls)
+    check("[32-L7] 采集尚未断流 → **不误发**告警（notifier 0 条）",
+          rec.messages == [], "n=%d" % len(rec.messages))
+    _assert_state("[32-L7] 兜底 check 确实落了状态文件（status=ok）", state, "status", "ok")
+
+    # --- L8：do_refresh 的**三条**「续期没拿到 cookie」分支都到达了 check ---
+    # 只用**注入 fetcher 的调用计数**做证据，不 spy tool.check（把锁 spy 在上游函数上，
+    # 「真正的副作用从未执行」也会全绿 —— 本仓历史教训）。
+    for label, browser in (("L8-浏览器ImportError", _browser_that_raises(ImportError)),
+                           ("L8-浏览器通用异常", _browser_that_raises(RuntimeError)),
+                           ("L8-profile为空", _empty_profile)):
+        tmp = _workdir()
+        cfg, state = _cfg_and_state(tmp, "reach_%s.yaml" % label)
+        rec = _Recorder()
+        fetch = _FakeFetcher(401, BODY_CODE_100)
+        try:
+            tool._browser_cookie_string = browser
+            rc, crash = _call_catching(tool.do_refresh, config_path=cfg, state_path=state,
+                                       fetcher=fetch, notifier=rec)
+        finally:
+            tool._browser_cookie_string = real_browser
+        check("[32-%s] 注入 fetcher 恰好被调用 1 次（该分支真到达了 check）" % label,
+              fetch.calls == 1, "calls=%d rc=%r crash=%s" % (fetch.calls, rc, crash))
+        check("[32-%s] 死凭证下 rc==2 且告警恰好 1 条" % label,
+              crash is None and rc == 2 and len(rec.messages) == 1,
+              "rc=%r n=%d crash=%s" % (rc, len(rec.messages), crash))
+
+    # --- L9：--login（run_browser_flow）的同名分支**刻意不跑 check、不告警** ---
+    # 故意喂死凭证 fetcher：一旦有人「顺手统一」两条路径，这里必然变成 rc=2 + 一条假告警。
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "login_empty_profile.yaml")
+    rec = _Recorder()
+    fetch = _FakeFetcher(401, BODY_CODE_100)
+    try:
+        tool._browser_cookie_string = _empty_profile
+        rc, crash = _call_catching(tool.do_login, config_path=cfg, state_path=state,
+                                   fetcher=fetch, notifier=rec)
+    finally:
+        tool._browser_cookie_string = real_browser
+    check("[32-L9] --login 未拿到 cookie → 不崩、rc==2", crash is None and rc == 2,
+          "rc=%r crash=%s" % (rc, crash))
+    check("[32-L9] --login 该分支**不**跑 check（注入 fetcher 0 次）—— 与 do_refresh 的分叉是刻意的",
+          fetch.calls == 0, "calls=%d" % fetch.calls)
+    check("[32-L9] --login 该分支**不**告警（notifier 0 条，人在现场不推「请扫码」）",
+          rec.messages == [], "n=%d" % len(rec.messages))
+    check("[32-L9] --login 该分支也不落状态文件", not os.path.exists(state), state)
+
+    # --- L10：日志不许与事实不符（profile 空不许被说成「浏览器不可用」）---
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "log_truth.yaml")
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Capture()
+    handler.setLevel(logging.DEBUG)
+    try:
+        tool._browser_cookie_string = _empty_profile
+        tool.LOG.addHandler(handler)
+        _call_catching(tool.do_refresh, config_path=cfg, state_path=state,
+                       fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=_Recorder())
+    finally:
+        tool.LOG.removeHandler(handler)
+        tool._browser_cookie_string = real_browser
+    joined = "\n".join(records)
+    check("[32-L10] profile 空这一路：日志如实点名了 profile / z_c0 这个真实原因",
+          "profile" in joined and "z_c0" in joined, "日志=%r" % (joined[:300],))
+    check("[32-L10] profile 空这一路：日志**没有**把原因说成『浏览器不可用』",
+          "浏览器不可用" not in joined, "日志=%r" % (joined[:300],))
 
 
 # ---------------------------------------------------------------------------
@@ -2699,6 +2846,7 @@ def main():
     test_state_path_blocked_by_file()
     test_tool_wiring_locks()
     test_browser_failure_still_runs_check()
+    test_profile_empty_path_probes_check()
     test_fake_notifier_is_the_one_used()
     test_no_network_egress()
     test_corrupt_state_file_is_visible()
