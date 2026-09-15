@@ -2134,6 +2134,363 @@ def test_alert_delivery_is_durable():
           "rc=%r n=%d crash=%s" % (rc_l5, len(n5.messages), crash_l5))
 
 
+# ---------------------------------------------------------------------------
+# [28] H1：读不动的状态文件不得静默吞掉一笔可能的未送达告警（且不得变成告警风暴）
+# ---------------------------------------------------------------------------
+# 缺陷形态（独立验证测得，本用例把它钉死）：状态文件是一份**内含 alert_pending: true 的坏
+# JSON**（磁盘上明明有一笔义务的证据），本次判定 anti_bot → 旧实现 rc=3、**0 次投递**、
+# alert_pending 被改写成 false、没有任何「未送达」标记，日志里只有一句通用的「状态文件无法解析」。
+CORRUPT_STATE_WITH_PENDING = (
+    '{\n'
+    '  "status": "auth_failed",\n'
+    '  "ts": "2026-09-01 06:00:00",\n'
+    '  "code": 100,\n'
+    '  "detail": "旧记录",\n'
+    '  "alert_pending": true,\n'
+    '  "alert_message": "[知乎Cookie] 站点=zhihu 状态=认证失败 ... --login",\n'
+    '  "broken": \n')          # ← 故意坏在这一行（缺值）
+
+
+def _unreadable_marker_lines(records):
+    return [r.getMessage() for r in records if tool.UNREADABLE_STATE_MARKER in r.getMessage()]
+
+
+def _read_state_probe(path):
+    """直接读一个路径，返回异常类型名（"OK" 表示读得动）—— 用于「场景自证」。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            f.read()
+    except FileNotFoundError:
+        return "FileNotFoundError"
+    except Exception as e:  # noqa: BLE001  被测的就是「这个路径读不动」
+        return type(e).__name__
+    return "OK"
+
+
+def test_unreadable_state_keeps_obligation():
+    print("\n[28] H1: 状态文件在盘上但读不动 → 必须公告「可能丢了一笔告警」，同一处损坏只响一次")
+    check("[28] 前置：坏样本里文本上确实写着 alert_pending: true（缺的是一份可解析的记录）",
+          '"alert_pending": true' in CORRUPT_STATE_WITH_PENDING, "")
+
+    # ---- 场景 1：坏状态文件 + 本次判定 anti_bot（旧实现：一次都不投递）----
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "unreadable.yaml")
+    _write_text(state, CORRUPT_STATE_WITH_PENDING)
+    check("[28] 场景自证：该状态文件确实解析不出来（否则本用例什么都没测）",
+          _read_json(state)[1] != "", repr(_read_json(state)[1]))
+    check("[28] 场景自证：anti_bot 自身**不会**告警（should_alert 对无历史返回 False）——"
+          "所以唯一能产生投递的就是『读不动』这条路径",
+          tool.should_alert("", "anti_bot") is False, "")
+
+    handler, records = _log_capture()
+    rec = _Recorder()
+    rc, crash = None, None
+    try:
+        rc, crash = _check_catching(config_path=cfg, state_path=state,
+                                    fetcher=_FakeFetcher(403, ""), notifier=rec)
+    finally:
+        tool.LOG.removeHandler(handler)
+    blob = "\n".join(r.getMessage() for r in records)
+    marker_lines = _unreadable_marker_lines(records)
+
+    check("[28] H1 坏状态文件 + anti_bot → 不抛异常且 rc==3（rc 契约不变）",
+          crash is None and rc == 3, "rc=%r crash=%s" % (rc, crash))
+    check("[28] H1 坏状态文件 + anti_bot → **告警真的发出去了**（旧实现：0 次投递）",
+          len(rec.messages) == 1, "n=%d" % len(rec.messages))
+    if rec.messages:
+        check("[28] H1 公告点名「可能被丢弃」并指向该状态文件（运维可执行）",
+              "可能" in rec.messages[0] and state in rec.messages[0], rec.messages[0])
+        check("[28] H1 公告不含 cookie 明文（DUMMY_COOKIE / z_c0= 都不出现）",
+              "DUMMY_COOKIE" not in rec.messages[0] and "z_c0=" not in rec.messages[0],
+              rec.messages[0])
+    check("[28] H1 日志里有独立的 UNREADABLE 标记行（与『状态文件无法解析』区分，便于 grep）",
+          len(marker_lines) >= 1, "n=%d" % len(marker_lines))
+    check("[28] H1 UNREADABLE 标记行与既有『状态文件无法解析』是两条不同的日志",
+          tool.UNREADABLE_STATE_MARKER in blob and "状态文件无法解析" in blob
+          and all("无法解析" not in m for m in marker_lines),
+          "marker_lines=%r" % (marker_lines[:1],))
+    check("[28] H1 本次运行把读不动的状态文件**重写成可用记录**（『同一处损坏只响一次』的前提）",
+          _read_json(state)[1] == "", repr(_read_json(state)[1]))
+    _assert_state("[28] H1 重写后 status = 本次判定 anti_bot", state, "status", "anti_bot")
+    _assert_state("[28] H1 公告已送达 → alert_pending=false", state, "alert_pending", False)
+
+    # ---- 场景 2（约束 i：不重复告警）：同一处损坏 × 连续 6 次运行 ----
+    tmp2 = _workdir()
+    cfg2, state2 = _cfg_and_state(tmp2, "storm.yaml")
+    _write_text(state2, CORRUPT_STATE_WITH_PENDING)
+    n2 = _FlakyNotifier(working=True)
+    rcs = []
+    for _ in range(6):
+        r, c = _check_catching(config_path=cfg2, state_path=state2,
+                               fetcher=_FakeFetcher(403, ""), notifier=n2)
+        rcs.append((r, c))
+    check("[28] H1 连续 6 次运行（同一处损坏）→ **恰好 1 次尝试 / 1 条送达**（既不是 6 条，也不是 0 条）",
+          n2.attempts == 1 and len(n2.delivered) == 1,
+          "attempts=%d delivered=%d" % (n2.attempts, len(n2.delivered)))
+    check("[28] H1 那 6 次全部 rc==3 且不抛异常（判定不受记账修复影响）",
+          all(c is None and r == 3 for (r, c) in rcs), repr(rcs))
+
+    # ---- 场景 3：损坏 → 修复 → **再次**损坏 = 新的一轮 ⇒ 必须再响一次（不是永久静默）----
+    _write_text(state2, CORRUPT_STATE_WITH_PENDING)
+    r3, c3 = _check_catching(config_path=cfg2, state_path=state2,
+                             fetcher=_FakeFetcher(403, ""), notifier=n2)
+    check("[28] H1 再次损坏（新的一轮 unreadable）→ 再响 1 次（累计 2 条），不清零也不刷屏",
+          c3 is None and r3 == 3 and len(n2.delivered) == 2 and n2.attempts == 2,
+          "rc=%r attempts=%d delivered=%d" % (r3, n2.attempts, len(n2.delivered)))
+
+    # ---- 场景 4：读不动 **且** 投递失败 → 义务必须留在盘上，恢复后恰好补投一次 ----
+    tmp3 = _workdir()
+    cfg3, state3 = _cfg_and_state(tmp3, "unreadable_fail.yaml")
+    _write_text(state3, CORRUPT_STATE_WITH_PENDING)
+    n3 = _FlakyNotifier(working=False)
+    r4, c4 = _check_catching(config_path=cfg3, state_path=state3,
+                             fetcher=_FakeFetcher(403, ""), notifier=n3)
+    check("[28] H1 读不动 + 投递失败 → 尝试 1 次、重写后 alert_pending=true（义务不丢）",
+          c4 is None and r4 == 3 and n3.attempts == 1
+          and _state_field(state3, "alert_pending")[0] is True,
+          "rc=%r attempts=%d pending=%r" % (r4, n3.attempts,
+                                           _state_field(state3, "alert_pending")[0]))
+    saved_note = _state_field(state3, "alert_message")[0]
+    n3.working = True
+    r5, c5 = _check_catching(config_path=cfg3, state_path=state3,
+                             fetcher=_FakeFetcher(403, ""), notifier=n3)
+    check("[28] H1 投递恢复 → **补投**那条公告（累计尝试 2 次、送达 1 条，不重复也不丢）",
+          c5 is None and r5 == 3 and n3.attempts == 2 and len(n3.delivered) == 1,
+          "rc=%r attempts=%d delivered=%d" % (r5, n3.attempts, len(n3.delivered)))
+    check("[28] H1 补投的正是重写时落盘的那条原文（一字不差）",
+          n3.delivered == [saved_note] and tool.UNREADABLE_STATE_MARKER in (saved_note or ""),
+          "delivered=%r saved=%r" % (n3.delivered, saved_note))
+    check("[28] H1 补投成功 → alert_pending 被清掉",
+          _state_field(state3, "alert_pending")[0] is False,
+          "alert_pending=%r" % (_state_field(state3, "alert_pending")[0],))
+
+    # ---- 场景 5（约束 iii）：读不动**且写不进去**（父路径被普通文件占位）----
+    # 这里刻意**不**合成公告：那种故障下重写必然失败，「本次已公告过」无处落盘，合成即等于
+    # 每次运行响一次的风暴。既有降级路径（rc=3 + 点名路径与 OS 错误的 ERROR 日志，见 [18]）
+    # 已经足够响，本用例把它钉住：宁可少响一次，也不把一台已经持续报错的机器变成告警源。
+    tmp4 = _workdir()
+    blocker = os.path.join(tmp4, "blocker")
+    with open(blocker, "wb") as f:
+        f.write(b"i am a regular file, not a directory\n")
+    cfg4 = _write_text(os.path.join(tmp4, "cfg.yaml"), _sanitized_real_text())
+    state4 = os.path.join(blocker, "state.json")
+    handler4, records4 = _log_capture()
+    rec4 = _Recorder()
+    r6, c6 = None, None
+    try:
+        r6, c6 = _check_catching(config_path=cfg4, state_path=state4,
+                                 fetcher=_FakeFetcher(403, ""), notifier=rec4)
+    finally:
+        tool.LOG.removeHandler(handler4)
+    blob4 = "\n".join(r.getMessage() for r in records4)
+    check("[28] H1 读不动 + 写不进去 → 不抛异常、降级 rc==3（既有 StateWriteError 路径）",
+          c6 is None and r6 == 3, "rc=%r crash=%s" % (r6, c6))
+    check("[28] H1 读不动 + 写不进去 → 不合成公告（无法落盘『已公告』= 合成就是每次运行都响）",
+          rec4.messages == [] and _unreadable_marker_lines(records4) == [],
+          "messages=%d markers=%d" % (len(rec4.messages), len(_unreadable_marker_lines(records4))))
+    check("[28] H1 读不动 + 写不进去时仍然**响亮**：日志点名路径与 OS 错误",
+          state4 in blob4 and ("NotADirectoryError" in blob4 or "FileExistsError" in blob4
+                               or "OSError" in blob4), blob4[-400:])
+
+    # ---- 场景 5b：真正的 OS 级读失败（状态路径是**目录** → PermissionError）----
+    # Windows 下「父路径被普通文件占位」在**读**这一步报的是 FileNotFoundError（等价于「没有
+    # 那个文件」），所以我另造一个确定性的 OSError：把状态路径指向一个目录。这条锁住
+    # 「打不开文件」这个分支本身：本工具只会往该路径写普通文件，所以那里不可能有它的记录
+    # ⇒ 不公告（否则就是每次运行响一次的风暴），但仍然 rc=3 且日志响亮。
+    tmp6 = _workdir()
+    dir_state = os.path.join(tmp6, "state_is_a_dir")
+    os.makedirs(dir_state)
+    cfg6, _unused = _cfg_and_state(tmp6, "dir_state.yaml")
+    handler6, records6 = _log_capture()
+    rec6 = _Recorder()
+    r8, c8 = None, None
+    try:
+        r8, c8 = _check_catching(config_path=cfg6, state_path=dir_state,
+                                 fetcher=_FakeFetcher(403, ""), notifier=rec6)
+    finally:
+        tool.LOG.removeHandler(handler6)
+    blob6 = "\n".join(r.getMessage() for r in records6)
+    check("[28] H1 场景自证：该状态路径确实打不开（目录），且是 OSError",
+          _read_state_probe(dir_state) == "PermissionError", _read_state_probe(dir_state))
+    check("[28] H1 读不动（OS 级）+ 写不进去 → rc==3 且不抛异常",
+          c8 is None and r8 == 3, "rc=%r crash=%s" % (r8, c8))
+    check("[28] H1 读不动（OS 级）→ 不合成公告（该路径上不可能有本工具写的记录 = 没有义务，"
+          "而公告无法落盘就会变成风暴）",
+          rec6.messages == [] and _unreadable_marker_lines(records6) == [],
+          "n=%d" % len(rec6.messages))
+    check("[28] H1 读不动（OS 级）仍然响亮：日志点名路径与 OS 错误，并走 StateWriteError 降级",
+          dir_state in blob6 and "PermissionError" in blob6 and "状态文件不可用" in blob6,
+          blob6[-400:])
+
+    # ---- 场景 6：读不动 **且** 本次判定 auth_failed → 转换公告与「可能丢告警」必须都在 ----
+    # 「两件事都要送达」在这里最容易退化成「只送后者」：一笔挂账的位置只有一个，
+    # 若用 lost_note 顶替本次转换的公告，运维就看不到 --login 这个可执行动作了。
+    tmp5 = _workdir()
+    cfg5, state5 = _cfg_and_state(tmp5, "unreadable_auth.yaml")
+    _write_text(state5, CORRUPT_STATE_WITH_PENDING)
+    n5 = _Recorder()
+    r7, c7 = _check_catching(config_path=cfg5, state_path=state5,
+                             fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=n5)
+    check("[28] H1 读不动 + auth_failed → 仍然**恰好 1 条**公告（合并不成队列）",
+          c7 is None and r7 == 2 and len(n5.messages) == 1,
+          "rc=%r n=%d" % (r7, len(n5.messages)))
+    if n5.messages:
+        check("[28] H1 读不动 + auth_failed → 公告**同时**带本次的可执行动作（--login）与丢告警警告",
+              "--login" in n5.messages[0] and tool.UNREADABLE_STATE_MARKER in n5.messages[0],
+              n5.messages[0])
+
+
+# ---------------------------------------------------------------------------
+# [29] H2：alert_pending=true 但 alert_message 不是可用字符串 → 合成公告，绝不静默清标记
+# ---------------------------------------------------------------------------
+def test_pending_without_usable_message():
+    print("\n[29] H2: alert_pending=true 但原文是 null / 非字符串 / 空白 → 合成通用公告并投递")
+    # 缺陷形态：`_pending_alert` 对非字符串返回 "" ⇒ 0 次投递 + alert_pending 翻 false +
+    # 连「未送达」标记都不打 —— 一笔义务被静默抹掉。只可能来自带外编辑或损坏，但代价同样是丢告警。
+    for label, bad in (("null", None), ("整数 42", 42), ("纯空白", "   ")):
+        tmp = _workdir()
+        cfg, state = _cfg_and_state(tmp, "h2_%s.yaml" % label.replace(" ", "_"))
+        _write_text(state, json.dumps(
+            {"status": "auth_failed", "ts": "2026-09-01 06:00:00", "code": 100,
+             "detail": "旧记录", "alert_pending": True, "alert_message": bad},
+            ensure_ascii=False))
+        check("[29] 场景自证（%s）：状态文件可解析且 alert_pending=true" % label,
+              _read_json(state)[1] == "" and _state_field(state, "alert_pending")[0] is True, "")
+
+        rec = _Recorder()
+        handler, records = _log_capture()
+        try:
+            rc, crash = _check_catching(config_path=cfg, state_path=state,
+                                        fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=rec)
+        finally:
+            tool.LOG.removeHandler(handler)
+        blob = "\n".join(r.getMessage() for r in records)
+
+        check("[29] H2（%s）不抛异常且 rc==2（rc 契约不变）" % label,
+              crash is None and rc == 2, "rc=%r crash=%s" % (rc, crash))
+        check("[29] H2（%s）同类别不产生新转换公告 → 唯独这笔债务必须被投递（旧实现：0 次）"
+              % label, len(rec.messages) == 1, "n=%d" % len(rec.messages))
+        if rec.messages:
+            check("[29] H2（%s）合成的公告点明『原文不可用』并给出人工动作" % label,
+                  "原文不可用" in rec.messages[0] and "人工" in rec.messages[0],
+                  rec.messages[0])
+            check("[29] H2（%s）公告不含 cookie 明文" % label,
+                  "DUMMY_COOKIE" not in rec.messages[0] and "z_c0=" not in rec.messages[0],
+                  rec.messages[0])
+        check("[29] H2（%s）这笔义务**没有被静默**：日志里有未送达标记" % label,
+              tool.PENDING_ALERT_MARKER in blob, blob[-300:])
+        check("[29] H2（%s）投递成功后 alert_pending→false（清标记发生在送达之后）" % label,
+              _state_field(state, "alert_pending")[0] is False,
+              "pending=%r" % (_state_field(state, "alert_pending")[0],))
+
+    # 反面对照：原文**可用**时不得被合成覆盖（补投仍是一字不差的原文）
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "h2_ok.yaml")
+    good = "[知乎Cookie] 站点=zhihu 状态=认证失败 code=100（旧原文）；需要人工 --login"
+    _write_text(state, json.dumps(
+        {"status": "auth_failed", "ts": "2026-09-01 06:00:00", "code": 100, "detail": "旧记录",
+         "alert_pending": True, "alert_message": good}, ensure_ascii=False))
+    rec = _Recorder()
+    rc, crash = _check_catching(config_path=cfg, state_path=state,
+                                fetcher=_FakeFetcher(401, BODY_CODE_100), notifier=rec)
+    check("[29] 对照：原文可用 → 原样补投（不被合成公告替换）",
+          crash is None and rc == 2 and rec.messages == [good], repr(rec.messages))
+
+
+# ---------------------------------------------------------------------------
+# [30] H3：取代语义在**两个方向**都被钉住，且被取代的原文必须进日志
+# ---------------------------------------------------------------------------
+# 「新的取代旧的」在恢复方向（→ok）上的正当性由 [27] C1 覆盖；本用例补上**非 ok 方向**：
+# 一笔未送达的 auth_failed 被 anti_bot 取代。随机回放显示大多数取代都发生在两个失败类别
+# 之间（此时恢复通知并不在场，旧注释给的理由不成立），所以这个方向必须被显式锁住 ——
+# 两个方向都不许改成「优先投旧的」。
+def test_supersede_locked_in_both_directions():
+    print("\n[30] H3: 「新公告取代旧公告」两个方向都锁住（含非 ok 方向）+ 原文必须进日志")
+
+    # --- 方向 A（非 ok → 非 ok，本用例新增）：未送达的 auth_failed 被 anti_bot 取代 ---
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "supersede_fail.yaml")
+    # 三次一组的脚本（_ScriptedFetcher 用尽后重复最后一个）：A0=ok 建历史 / A1=401 / A2=403
+    f = _ScriptedFetcher([(200, _ok_body()), (401, BODY_CODE_100), (403, "")])
+    failing = _FlakyNotifier(working=False)
+
+    rc_a0, crash_a0 = _check_catching(config_path=cfg, state_path=state,
+                                      fetcher=f, notifier=failing)
+    check("[30] A0 前置：ok 历史建立（rc==0、无投递）",
+          crash_a0 is None and rc_a0 == 0 and failing.attempts == 0,
+          "rc=%r attempts=%d" % (rc_a0, failing.attempts))
+    rc_a1, crash_a1 = _check_catching(config_path=cfg, state_path=state,
+                                      fetcher=f, notifier=failing)
+    lost_auth = _state_field(state, "alert_message")[0]
+    check("[30] A1 未送达的 auth_failed 公告挂在账上（pending=true、原文含 --login）",
+          crash_a1 is None and rc_a1 == 2 and failing.attempts == 1
+          and _state_field(state, "alert_pending")[0] is True
+          and isinstance(lost_auth, str) and "认证失败" in lost_auth and "--login" in lost_auth,
+          "rc=%r attempts=%d msg=%r" % (rc_a1, failing.attempts, lost_auth))
+
+    working = _FlakyNotifier(working=True)
+    handler, records = _log_capture()
+    try:
+        rc_a2, crash_a2 = _check_catching(config_path=cfg, state_path=state,
+                                          fetcher=f, notifier=working)
+    finally:
+        tool.LOG.removeHandler(handler)
+    blob = "\n".join(r.getMessage() for r in records)
+    sup_lines = [r.getMessage() for r in records if "取代" in r.getMessage()]
+
+    check("[30] H3 非 ok 方向：auth_failed→anti_bot → 只投递**本次**那条（恰好 1 条）",
+          crash_a2 is None and rc_a2 == 3 and len(working.delivered) == 1,
+          "rc=%r delivered=%d" % (rc_a2, len(working.delivered)))
+    if working.delivered:
+        check("[30] H3 非 ok 方向：送达的是 anti_bot 公告（旧实现语义），不是那条旧的 auth_failed",
+              "风控" in working.delivered[0] and "认证失败" not in working.delivered[0],
+              working.delivered[0])
+    check("[30] H3 取代被明确记录（PENDING_ALERT_MARKER + 取代），不是静默丢弃",
+          len(sup_lines) == 1 and tool.PENDING_ALERT_MARKER in sup_lines[0],
+          "sup_lines=%r" % (sup_lines[:1],))
+    check("[30] H3 **被取代的原文进了日志**（企微是唯一通道，日志是唯一可审计落点）",
+          len(sup_lines) == 1 and "认证失败" in sup_lines[0] and "--login" in sup_lines[0],
+          "sup_lines=%r" % (sup_lines[:1],))
+    check("[30] H3 取代后义务仍**有界**（一条），送达成功即清零",
+          _state_field(state, "alert_pending")[0] is False
+          and _state_field(state, "alert_message")[0] is None,
+          "pending=%r msg=%r" % (_state_field(state, "alert_pending")[0],
+                                 _state_field(state, "alert_message")[0]))
+
+    # --- 方向 B（恢复方向，与 [27] C1 同构但独立构造）：未送达的 auth_failed 被 →ok 取代 ---
+    tmp2 = _workdir()
+    cfg2, state2 = _cfg_and_state(tmp2, "supersede_recover.yaml")
+    f2 = _ScriptedFetcher([(200, _ok_body()), (401, BODY_CODE_100), (200, _ok_body())])
+    failing2 = _FlakyNotifier(working=False)
+    _check_catching(config_path=cfg2, state_path=state2, fetcher=f2, notifier=failing2)
+    rc_b1, crash_b1 = _check_catching(config_path=cfg2, state_path=state2,
+                                      fetcher=f2, notifier=failing2)
+    lost_auth2 = _state_field(state2, "alert_message")[0]
+
+    working2 = _FlakyNotifier(working=True)
+    handler2, records2 = _log_capture()
+    try:
+        rc_b2, crash_b2 = _check_catching(config_path=cfg2, state_path=state2,
+                                          fetcher=f2, notifier=working2)
+    finally:
+        tool.LOG.removeHandler(handler2)
+    blob2 = "\n".join(r.getMessage() for r in records2)
+    sup_lines2 = [r.getMessage() for r in records2 if "取代" in r.getMessage()]
+
+    check("[30] 方向 B 前置：未送达的 auth_failed 公告挂账",
+          crash_b1 is None and rc_b1 == 2 and failing2.attempts == 1
+          and isinstance(lost_auth2, str) and "认证失败" in lost_auth2,
+          "rc=%r attempts=%d" % (rc_b1, failing2.attempts))
+    check("[30] H3 恢复方向：auth_failed→ok → 投递**恢复通知**（1 条，非那条旧的失败公告）",
+          crash_b2 is None and rc_b2 == 0 and len(working2.delivered) == 1
+          and "已恢复" in working2.delivered[0],
+          "rc=%r delivered=%r" % (rc_b2, working2.delivered))
+    check("[30] H3 两个方向的取代规则一致：都保留本次公告、都丢弃旧公告、旧原文都进日志",
+          len(sup_lines2) == 1 and "认证失败" in sup_lines2[0]
+          and "认证失败" not in working2.delivered[0],
+          "sup_lines=%r delivered=%r" % (sup_lines2[:1], working2.delivered))
+
+
 def main():
     print("=" * 70)
     print("知乎 Cookie 工具行为级测试（离线）：写入守卫 / EOL / 幂等 / 回读校验 / 状态变化告警")
@@ -2170,6 +2527,9 @@ def main():
     test_deep_yaml_is_config_error()
     test_login_refresh_writeback_is_observable()
     test_alert_delivery_is_durable()
+    test_unreadable_state_keeps_obligation()
+    test_pending_without_usable_message()
+    test_supersede_locked_in_both_directions()
     test_real_config_untouched()
 
     print("=" * 70)

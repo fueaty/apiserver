@@ -30,6 +30,15 @@
 之后**每一次**运行都会重试（即使类别没变、should_alert 返回 False），只有投递成功才清掉。
 于是「投递失败的告警」不会在故障窗口里消失。退出码**不受投递结果影响**，仍是 0/2/3。
 
+两处「不能静默丢义务」的补丁（都对应 tests 里的行为级用例）：
+
+  · 状态文件**在盘上但读不动**（坏 JSON / 顶层不是对象）：读不出记录 ⇒ 既不知道上次是
+    什么类别，也**不知道有没有一笔未送达的告警**。此时按「可能有」处理，合成一条公告并
+    把状态文件重写成可用记录 —— 同一处损坏只会响一次（重写后下次就读得动了）。
+    日志用 `UNREADABLE_STATE_MARKER` 与既有的 `状态文件无法解析`（宽容降级）区分。
+  · `alert_pending=true` 但 `alert_message` 不是可用字符串（null / 42 / 空白 —— 只可能来自
+    带外编辑或损坏）：**不能**把它当成「没有义务」而悄悄清标记，要合成一条通用公告补投。
+
 依赖约束
 --------
 playwright **只在 --login / --refresh 内部延迟导入**，因此本文件可在没有 playwright
@@ -109,6 +118,11 @@ AUTH_LABELS = {101: "无凭证/未识别", 100: "凭证过期"}
 # 告警投递是**持久化义务**，不是一次性副作用：投递失败时状态文件会记 alert_pending=true，
 # 之后每次运行都会重试，并在日志里打出这一行（运维 grep 这个标记就知道「有告警没送到」）。
 PENDING_ALERT_MARKER = "未送达告警"
+
+# 状态文件在盘上、但读不出记录时用的标记。刻意**不**复用 `状态文件无法解析`：
+# 那条是「宽容降级、本次按无历史继续」，这条是「主动公告：可能有告警被丢弃」。运维 grep
+# 到这一行就知道要去查那台机器的状态文件，而不是以为只是一次无害的读失败。
+UNREADABLE_STATE_MARKER = "状态文件不可读"
 
 
 class TransportError(Exception):
@@ -294,25 +308,44 @@ def resolve_state_path(explicit=None):
 
 
 def _read_state(path):
-    """读取状态文件；**宽容**地把任何读不动的形态当成「无历史」，但绝不静默。
+    """读取状态文件，返回 `(record, unreadable)`。
+
+    `unreadable` 为空串表示「拿到了一个可用记录」或「文件不存在（全新部署，按无历史）」；
+    非空表示**文件在那儿但拿不到记录**，其值是一句给日志/公告用的原因。
 
     宽容是刻意的：状态文件只是「是否要告警」的判据，读坏了不应该让采集监控本身挂掉。
-    但降级必须可见 —— 否则一个被写坏的 json 会永久静默掉后续所有告警。
+    但降级必须可见，而且**不能因此假装「没有未送达的告警」** —— 一个被写坏的 json 既能
+    静默掉后续所有告警，也能悄悄吞掉一笔已经挂在账上的告警义务（调用方据此公告，见 check）。
+
+    为什么 OS 级失败（**打不开**文件：被目录占位 / 权限不足 / 父路径被普通文件占位）不返回原因：
+
+      · 本工具只会通过 `_write_state` 往这个路径原子写**普通文件**，所以「打不开」意味着该
+        路径上不可能放着一份本工具写下的记录 ⇒ 没有可恢复的义务（不是「静默丢弃」，是「本来
+        就没有」）；
+      · 这类故障下 `_write_state` 几乎必然也失败（→ StateWriteError → rc=3，日志已点名路径
+        与 OS 错误，见 tests [18]），「本次已经公告过」无处落盘 ⇒ 若此时也公告，就把一处
+        持久性故障变成**每次运行响一次**的风暴，而「同一处故障只响一次」正是本工具的取舍。
+
+    内容级失败（文件在、但解析不出来 / 顶层不是对象）则不同：那份记录**是本工具写的**，里面
+    可能正躺着一笔未送达的告警；而文件就在预期路径上，本次运行能把它重写成可用记录 ⇒ 公告
+    只会有一次（同一处损坏不会再响，见 tests [28] 的 6 连跑）。
     """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        return {}
+        return {}, ""
     except Exception as e:
         LOG.warning("状态文件无法解析（%s）：%s: %s；本次按『无历史』继续（不重复告警判据失效）",
                     path, type(e).__name__, e)
-        return {}
+        if isinstance(e, OSError):
+            return {}, ""
+        return {}, "%s: %s" % (type(e).__name__, e)
     if not isinstance(data, dict):
         LOG.warning("状态文件顶层不是 JSON 对象（%s，实际类型 %s）；本次按『无历史』继续",
                     path, type(data).__name__)
-        return {}
-    return data
+        return {}, "顶层不是 JSON 对象（实际类型 %s）" % type(data).__name__
+    return data, ""
 
 
 def _write_state(path, record):
@@ -356,11 +389,49 @@ def _state_record(state, code, detail, pending_message):
 
 
 def _pending_alert(record):
-    """从状态记录里取出「上一次转换的告警，且尚未送达」的原文；没有则返回 ""。"""
+    """从状态记录里取出「上一次转换的告警，且尚未送达」的原文；没有则返回 ""。
+
+    ⚠️ `alert_pending=true` 但原文不可用（缺字段 / null / 非字符串 / 纯空白 —— 只可能来自
+    带外编辑或损坏）时**绝不能**当成「没有义务」：旧实现直接返回 ""，于是这笔义务被静默清掉
+    （投递 0 次、alert_pending 翻成 false、连 PENDING_ALERT_MARKER 都不打）。这里合成一条
+    通用公告顶上 —— 原文补不回来，但「有一笔告警丢了」这件事必须传出去。
+    """
     if not record.get("alert_pending"):
         return ""
     message = record.get("alert_message")
-    return message if isinstance(message, str) else ""
+    if isinstance(message, str) and message.strip():
+        return message
+    LOG.error("%s：状态文件 alert_pending=true 但 alert_message 不是可用的字符串（%r），"
+              "原文无法补投；合成一条通用公告顶上（绝不把义务当没有）",
+              PENDING_ALERT_MARKER, message)
+    return generic_pending_alert_message(record)
+
+
+def generic_pending_alert_message(record):
+    """`alert_pending=true` 但原文不可用时合成的通用公告。
+
+    刻意不复述具体类别（原文丢了，猜类别只会误导），但必须给出**可执行的动作**：
+    查告警通道、查状态文件。detail/code 来自落盘时的判定信息，不含 cookie 明文。
+    """
+    return ("[知乎Cookie] 站点=zhihu 状态=%s code=%s；状态文件标记 alert_pending=true"
+            "（有一笔告警未送达），但 alert_message 原文不可用（%r），无法原样补投。"
+            "请人工检查告警通道与状态文件。detail=%s"
+            % (record.get("status") or "?", record.get("code"),
+               record.get("alert_message"), record.get("detail") or ""))
+
+
+def unreadable_state_alert_message(path, reason, state, code, detail):
+    """状态文件在盘上但读不动时合成的公告。
+
+    读不出记录 ⇒ 无法知道上一次是什么类别，也**无法知道有没有一笔未送达的告警**（原文就
+    躺在那个读不动的文件里）。原文不可恢复，所以只能说清「可能有一条告警被丢弃」并把本次
+    判定一起带上；宁可多响一次，也不静默吞掉一笔可能的义务（本工具存在的意义就是会响）。
+    """
+    return ("[知乎Cookie] 站点=zhihu %s（%s：%s）；无法确认上一次状态转换的告警是否已送达，"
+            "可能有一条告警被丢弃。本次判定 state=%s code=%s（%s）。"
+            "请人工检查该状态文件与告警通道。"
+            % (UNREADABLE_STATE_MARKER, path, reason,
+               state, "n/a" if code is None else code, detail))
 
 
 # ---------------------------------------------------------------------------
@@ -470,11 +541,24 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
             state, code = STATE_ERROR, 0
 
     LOG.info("状态文件: %s", resolved_state)
-    previous_record = _read_state(resolved_state)
+    previous_record, state_unreadable = _read_state(resolved_state)
     previous = str(previous_record.get("status") or "")
     # 上一次转换的告警如果**没有送到**，它就是一笔尚未偿还的债：本次必须重试，
     # 哪怕本次状态与上次完全相同（那种情况下 should_alert 会返回 False）。
     pending_message = _pending_alert(previous_record)
+    if state_unreadable:
+        # 文件在盘上却读不出记录 ⇒ 那条记录里可能正躺着一笔未送达的告警。原文已不可恢复，
+        # 于是合成一条公告当作本次的待投递告警（与本次转换的公告合并，见下面 `if lost_note`）。
+        # 关键：本次运行结束时会把状态文件**重写成可用记录**，所以同一处损坏只会响一次 ——
+        # 不重复告警这条约束靠「修复 + 落盘」而不是靠内存里的去重状态。
+        # 与上面的 `状态文件无法解析` 区分：那条是宽容降级，这条是主动公告（独立标记便于 grep）。
+        lost_note = unreadable_state_alert_message(
+            resolved_state, state_unreadable, state, code, detail)
+        LOG.error("%s：状态文件读不动（%s：%s），无法判断是否存在未送达的告警；本次按『可能有』"
+                  "处理并公告，同时把状态文件重写为可用记录（同一处损坏只会响一次）",
+                  UNREADABLE_STATE_MARKER, resolved_state, state_unreadable)
+    else:
+        lost_note = ""
     if pending_message:
         LOG.error("%s：状态文件 alert_pending=true —— 上一次状态转换的告警没有送达，"
                   "本次运行会重试投递（这是运维唯一会看到这件事的地方）", PENDING_ALERT_MARKER)
@@ -497,14 +581,28 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
             LOG.warning("上次状态 %r → 本次 %r：不重复告警",
                         previous or "<无历史>", state)
 
+    if lost_note:
+        # 读不动的状态文件带来的「可能丢了告警」和本次转换的公告**都**要送达，合并成一条：
+        # 投递义务必须恒为**有界**的一条（合并后仍是 1 条，不是 2 条，更不是队列）。
+        alert = (alert + "\n" + lost_note) if alert else lost_note
+
     # 本次要送达的告警 = 本次转换的告警（若有）优先，否则是上次欠下的那条。
-    # 为什么**新的取代旧的**（而不是排队补发）：状态机的语义是「只在类别变化时公告当前
-    # 类别」，而 →ok 的恢复通知本身就讲清了上一段故障的结局；在已经恢复之后再补发一条
-    # 「状态=认证失败，需要人工 --login 扫码登录」只会变成一次需要人工去排除的**假警报**。
-    # 被取代的那条在日志里明确记录，绝不静默丢弃。
+    #
+    # 实际规则（**不是**旧注释说的那样）：新的公告**总是**取代一笔未送达的旧公告，方向不限。
+    # 理由是状态机的语义：一笔挂账代表「**当前类别**还没被公告出去」，而不是「历史上每个类别
+    # 都要各公告一次」。类别一变，旧公告描述的就是过去的状态，只保留最新的那条才能让义务
+    # 恒为 1 条（有界），也避免拿过期状态当现况误导运维。
+    #
+    # ⚠️ 真实代价（旧注释用「→ok 的恢复通知已经讲清了上一段故障的结局」解释，那只覆盖恢复
+    # 方向）：**非 ok → 非 ok 的转换同样会取代**一笔未送达的旧公告，而恢复通知并不在场。
+    # 随机回放里大多数取代都发生在两个失败类别之间（未送达的 auth_failed 被 anti_bot 取代）。
+    # 此时被取代的那个条件**可能永远不会到达运维**（企微是唯一通道）；唯一的缓解是把被取代
+    # 的原文**完整写进日志**（下面这行），让日志成为可审计的落点。tests 的 [30] 用两个方向
+    # 的用例把这个取舍钉住（两个方向都不许改）。
     if alert and pending_message and alert != pending_message:
         LOG.warning("%s：上一次未送达的告警已被本次转换的告警取代（旧告警描述的状态已经过去，"
-                    "本次告警已说明结局）", PENDING_ALERT_MARKER)
+                    "本次告警已说明结局）；被取代的原文仅日志可查，可能不会到达运维=%s",
+                    PENDING_ALERT_MARKER, pending_message)
     to_deliver = alert or pending_message
 
     # ⚠️ 顺序是刻意的：**先把「这次转换的公告还没送到」落盘，再尝试投递**。
