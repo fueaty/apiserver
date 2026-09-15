@@ -151,16 +151,19 @@ def read_cookie_auth(yaml_path):
         raise CookieConfigError("配置文件不是 UTF-8 文本: %s (%s)" % (yaml_path, e))
     except yaml.YAMLError as e:
         raise CookieConfigError("配置文件不是合法 YAML: %s (%s)" % (yaml_path, e))
-    except RecursionError as e:
-        # 深层嵌套（≥ 数百层）会让解析器递归爆栈。这不是「YAML 语法错」，但同样属于
-        # 「这份配置读不动」：必须归到同一个「配置不可用」类别（→ rc=3），绝不能让它
-        # 逃出 check() 变成 rc=1 —— 那种 rc 既不写状态文件也不发告警。
-        raise CookieConfigError(
-            "配置文件嵌套过深，YAML 解析超出递归上限: %s (%s: %s)"
-            % (yaml_path, type(e).__name__, e))
     except Exception as e:
-        # 兜底：解析期的任何其它失败（MemoryError、解析器内部异常…）都归入「配置不可用」。
-        # 这里**不是**吞异常，而是把它换成一个调用方（check）明确会处理的类别。
+        # 兜底（**唯一**的解析期兜底路径，故意只有一条）：解析期的任何失败都归入
+        # 「配置不可用」，由调用方（check）映射成 rc=3。
+        #   · 深层嵌套（≥ 数百层）会让解析器递归爆栈 → RecursionError（Exception 的子类）；
+        #   · MemoryError / 解析器内部异常等同理。
+        # 绝不能让它逃出 check() 变成 rc=1 —— 那种 rc 既不写状态文件也不发告警。
+        # 这里**不是**吞异常，而是把它换成一个调用方明确会处理的类别。
+        #
+        # ⚠️ 曾经这里还有一条更靠前的 `except RecursionError:` 专用分支。它是**死代码**：
+        # RecursionError 是 Exception 的子类，本分支会以完全相同的方式收敛它，删掉专用
+        # 分支后 900 层嵌套的行为逐字不变（tests/test_zhihu_cookie_refresh.py 的 [25]
+        # 用例锁住这一点，并对**这个**分支做变异验证）。本仓库的教训：多一条守卫不等于
+        # 多一分保障——只有能独立鉴别行为的守卫才值得留。
         raise CookieConfigError(
             "配置文件解析失败: %s (%s: %s)" % (yaml_path, type(e).__name__, e))
 

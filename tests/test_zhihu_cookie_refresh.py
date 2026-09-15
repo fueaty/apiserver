@@ -497,6 +497,38 @@ class _Recorder(object):
         self.messages.append(message)
 
 
+class _ScriptedFetcher(object):
+    """按调用次序返回预设的 (status, body)；用尽后重复最后一个（便于跑同一段序列）。"""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def __call__(self, url, cookie, timeout=10):
+        index = min(self.calls, len(self.responses) - 1)
+        self.calls += 1
+        return self.responses[index]
+
+
+class _FlakyNotifier(object):
+    """可切换「投递失败 / 投递成功」的 notifier，记录**每一次尝试**与**每一条真正送达**的文案。
+
+    attempts 与 delivered 必须分开看：两次都算「尝试」，只有 working=True 那次算「送达」。
+    「恰好一次」这条断言正是建立在这个区分上的（尝试可以 >1，送达必须 ==1）。
+    """
+
+    def __init__(self, working=False):
+        self.working = working
+        self.attempts = 0
+        self.delivered = []
+
+    def __call__(self, message):
+        self.attempts += 1
+        if not self.working:
+            raise RuntimeError("wecom webhook 不可用（注入的确定性失败）")
+        self.delivered.append(message)
+
+
 BODY_CODE_101 = json.dumps({"code": 101, "name": "AuthenticationError",
                             "message": "\u8eab\u4efd\u672a\u7ecf\u8fc7\u9a8c\u8bc1"}, ensure_ascii=False)
 BODY_CODE_100 = json.dumps({"code": 100, "name": "AuthenticationInvalidRequest",
@@ -517,6 +549,41 @@ def _check_catching(**kwargs):
     """
     try:
         return tool.check(**kwargs), None
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+def _check_catching_base(**kwargs):
+    """同 `_check_catching`，但**连 BaseException 一起**收敛成返回值。
+
+    G4 的场景是 notifier 抛 SystemExit：它必须照常逃出 check()（我们刻意不 catch
+    BaseException），所以只有把 BaseException 也接住，才能既断言「确实逃出去了」，
+    又让用例继续跑下去断言「状态里的 alert_pending 已落盘」。
+    """
+    try:
+        return tool.check(**kwargs), None
+    except BaseException as e:  # noqa: BLE001  被测的就是「SystemExit 不被吞掉」
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+def _call_catching(fn, *args, **kwargs):
+    """把任意直接调用点的「抛未捕获异常」收敛成可断言的 (result, crash)。
+
+    理由同 `_check_catching`，但用在 tool.apply_refreshed_cookie 这类**非 check** 的
+    用法点上：G3 说 tool:571 那次 _write_back 被去掉时，原来只会让
+    CookieWriteVerificationError 逃出用例把整个 runner 崩掉（= (b) subprocess crash），
+    那不是行为级检出。改成返回值后它是一条普通 [FAIL]，带行号。
+    """
+    try:
+        return fn(*args, **kwargs), None
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+def _read_auth_catching(path):
+    """读 cookie.auth，把异常收敛成 (value, crash)；理由同 `_read_json`。"""
+    try:
+        return cookie_store.read_cookie_auth(path), None
     except Exception as e:
         return None, "%s: %s" % (type(e).__name__, e)
 
@@ -769,17 +836,45 @@ def test_refresh_write_decision():
     cookie_store.write_cookie_auth(cfg, NEW_COOKIE)  # 先让磁盘上就是 NEW_COOKIE
     before = open(cfg, "rb").read()
 
-    wrote_same = tool.apply_refreshed_cookie(cfg, NEW_COOKIE)
-    check("[14] 串未变化 → 返回 False（跳过写回）", wrote_same is False, repr(wrote_same))
+    wrote_same, crash_same = _call_catching(tool.apply_refreshed_cookie, cfg, NEW_COOKIE)
+    check("[14] 串未变化 → 返回 False（跳过写回）",
+          crash_same is None and wrote_same is False,
+          "wrote=%r crash=%s" % (wrote_same, crash_same))
     check("[14] 串未变化 → 文件逐字节未动", open(cfg, "rb").read() == before, "")
 
     changed = NEW_COOKIE + "; extra=1"
-    wrote_new = tool.apply_refreshed_cookie(cfg, changed)
-    check("[14] 串有变化 → 返回 True（已落盘）", wrote_new is True, repr(wrote_new))
+    wrote_new, crash_new = _call_catching(tool.apply_refreshed_cookie, cfg, changed)
+    check("[14] 串有变化 → 返回 True（已落盘）",
+          crash_new is None and wrote_new is True,
+          "wrote=%r crash=%s" % (wrote_new, crash_new))
     check("[14] 串有变化 → 回读即为新值", cookie_store.read_cookie_auth(cfg) == changed, "")
     check("[14] 串有变化 → 仍只改 auth 行（行数不变）",
           len(open(cfg, "rb").read().splitlines(keepends=True)) == len(before.splitlines(keepends=True)),
           "")
+
+    # --- U2/G3：第二个 _write_back 用法点（tool:571，apply_refreshed_cookie 内部）---
+    # 锁在**可观察的文件效果**上。把 tool:571 那次 `_write_back(...)` 去掉时，
+    #   · 旧写法：外层的回读复验抛 CookieWriteVerificationError，逃出用例 ⇒ 整个 runner
+    #     崩掉 = (b) subprocess crash（不算真正的行为级检出，而且会掩盖后面所有用例）；
+    #   · 现在：经 `_call_catching` 收敛成返回值 ⇒ 普通的 [FAIL]，带调用点行号 = (a)。
+    obs_cfg = _write_text(os.path.join(tmp, "writeback_obs.yaml"), _sanitized_real_text())
+    obs_target = "u2|second-usage==point"
+    obs_before = open(obs_cfg, "rb").read()
+    obs_auth0, obs_crash0 = _read_auth_catching(obs_cfg)
+    check("[14] 场景自证：目标串与磁盘现值不同（否则『文件变了』无从谈起）",
+          obs_crash0 is None and obs_auth0 != obs_target, "crash=%s" % (obs_crash0 or "-"))
+
+    obs_result, obs_crash = _call_catching(tool.apply_refreshed_cookie, obs_cfg, obs_target)
+    check("[14] U2 tool:571 串有变化 → apply_refreshed_cookie 不抛异常且返回 True",
+          obs_crash is None and obs_result is True,
+          "result=%r crash=%s" % (obs_result, obs_crash))
+    obs_after = open(obs_cfg, "rb").read()
+    check("[14] U2 tool:571 可观察效果：目标文件**字节确实变了**", obs_after != obs_before,
+          "字节未变 ⇒ tool:571 那次 _write_back 没发生")
+    obs_auth, obs_read_crash = _read_auth_catching(obs_cfg)
+    check("[14] U2 tool:571 可观察效果：回读 == 传入的新串",
+          obs_read_crash is None and obs_auth == obs_target,
+          "回读 %r crash=%s" % (obs_auth, obs_read_crash))
 
     dry_before = open(cfg, "rb").read()
     wrote_dry = tool.apply_refreshed_cookie(cfg, changed + "; dry=1", dry_run=True)
@@ -1572,11 +1667,20 @@ def test_alert_delivery_failure_is_contained():
 
     handler2, records2 = _log_capture()
     rc2, crash2 = None, None
+    fail_order = []
+    real_writer2 = tool._write_state
+
+    def counting_writer(path, record):
+        fail_order.append("write_state")
+        return real_writer2(path, record)
+
+    tool._write_state = counting_writer
     try:
         rc2, crash2 = _check_catching(config_path=cfg2, state_path=state2,
                                       fetcher=_FakeFetcher(401, BODY_CODE_100),
                                       notifier=exploding_notifier)
     finally:
+        tool._write_state = real_writer2
         tool.LOG.removeHandler(handler2)
     blob2 = "\n".join(r.getMessage() for r in records2)
     check("[24] E1 注入 notifier 抛异常 → 不抛未捕获异常且 rc==2",
@@ -1585,6 +1689,17 @@ def test_alert_delivery_failure_is_contained():
                   "auth_failed")
     check("[24] E1 注入 notifier 抛异常 → 投递失败被明确记录",
           "告警投递失败" in blob2, blob2[-600:])
+    # G1：投递**失败**时只能有一次落盘（写入 pending 标记），绝不能出现「清标记」的第二次。
+    # 这是「mark delivered ONLY on success」的可观察等价物。
+    _assert_state("[24] G1 投递失败 → 状态文件 alert_pending 保持 true",
+                  state2, "alert_pending", True)
+    saved_msg = _state_field(state2, "alert_message")[0]
+    check("[24] G1 投递失败 → 未送达的告警原文被持久化（下次运行才能原样补投）",
+          isinstance(saved_msg, str) and "code=100" in saved_msg and "--login" in saved_msg
+          and "DUMMY_COOKIE" not in saved_msg,
+          "alert_message=%r" % (saved_msg,))
+    check("[24] G1 投递失败的那次运行只落盘一次（清标记只允许在成功之后）",
+          fail_order == ["write_state"], repr(fail_order))
 
     # 变体 2（顺序锁）：把 cookie_store.notify 换成**会抛**的实现 —— 也就是「绝不抛」这条
     # 契约被破坏。此时状态转换必须**已经落盘**（先写状态、再发告警），异常也不得逃出 check()。
@@ -1638,10 +1753,18 @@ def test_alert_delivery_failure_is_contained():
     finally:
         tool._write_state = real_writer
         cookie_store.notify = real_notify4
-    check("[24] E1 事件顺序：状态落盘**先于**告警投递", order == ["write_state", "notify"],
-          repr(order))
+    check("[24] E1 事件顺序：状态/pending 标记的落盘**先于**告警投递",
+          order[:2] == ["write_state", "notify"], repr(order))
+    # G1 让「送达与否」也持久化：投递**成功**后必须再落一次盘把 alert_pending 清掉。
+    # 这条比原来的 `order == ["write_state", "notify"]` 更严：它同时钉住
+    #   ① 清标记只可能发生在投递之后（先 notify 再写 ⇒ 红）；
+    #   ② 投递成功必然产生第二次落盘（漏掉 ⇒ 下次会重复投递，见 [27]）。
+    check("[24] G1 事件顺序：投递成功后**再落一次盘**记录『已送达』",
+          order == ["write_state", "notify", "write_state"], repr(order))
+    _assert_state("[24] G1 投递成功 → 状态文件 alert_pending 被清为 false",
+                  state4, "alert_pending", False)
     check("[24] E1 顺序锁场景本身有效（有告警被投递且 rc==2）",
-          crash4 is None and rc4 == 2 and order == ["write_state", "notify"],
+          crash4 is None and rc4 == 2 and order[:2] == ["write_state", "notify"],
           "rc=%r crash=%s order=%r" % (rc4, crash4, order))
 
 
@@ -1671,14 +1794,24 @@ def test_deep_yaml_is_config_error():
           boom == "RecursionError", "boom=%r" % (boom,))
 
     raised = ""
+    detail = ""
     try:
         cookie_store.read_cookie_auth(deep)
-    except cookie_store.CookieConfigError:
+    except cookie_store.CookieConfigError as e:
         raised = "CookieConfigError"
+        detail = str(e)
     except Exception as e:  # noqa: BLE001
         raised = "%s: %s" % (type(e).__name__, e)
-    check("[25] E2 cs:140 深嵌套 → 收敛为 CookieConfigError（不再是 RecursionError）",
+    # ⚠️ G2：这里**没有** RecursionError 专用分支 —— 收敛它的是 cs:154 那条唯一的兜底
+    # `except Exception`（RecursionError 是 Exception 的子类）。曾经那条更靠前的专用分支是
+    # 死代码：删掉它这条断言仍然全绿（这正是「有守卫 ≠ 需要守卫」）。所以本用例的鉴别力
+    # 必须落在**真正接住它的那条路径**上：把 cs:154 改成 `except ValueError`（RecursionError
+    # 于是不再被接住）时，这一行会以 (a) 的形式红，而不是只让某个专用分支消失。
+    check("[25] E2 cs:154 深嵌套 → 由唯一的兜底分支收敛为 CookieConfigError（不再是 RecursionError）",
           raised == "CookieConfigError", repr(raised))
+    check("[25] E2 收敛后的错误信息带上底层异常类型 RecursionError 与文件路径（可诊断）",
+          raised == "CookieConfigError" and "RecursionError" in detail and deep in detail,
+          "detail=%s" % (detail[-160:],))
 
     rec = _Recorder()
     rc, crashed = _check_catching(config_path=deep, state_path=state,
@@ -1770,6 +1903,203 @@ def test_login_refresh_writeback_is_observable():
           open(cfg3, "rb").read() == before3, "")
 
 
+# ---------------------------------------------------------------------------
+# [27] G1/G4：告警投递是**持久化义务**——投递失败会被重试、成功只补投一次、SystemExit 也不丢
+# ---------------------------------------------------------------------------
+def test_alert_delivery_is_durable():
+    print("\n[27] G1/G4: 投递失败的告警是持久化债务（重试 / 恰好一次 / 不重复 / SystemExit 兜住）")
+    check("[27] 场景自证：存在可 grep 的『未送达』日志标记常量",
+          isinstance(getattr(tool, "PENDING_ALERT_MARKER", None), str)
+          and str(tool.PENDING_ALERT_MARKER).strip() != "",
+          repr(getattr(tool, "PENDING_ALERT_MARKER", None)))
+    marker = tool.PENDING_ALERT_MARKER
+
+    # ===== 主场景（题目给的 B1/B2/B3/C1/D1/D2 序列）=====
+    # A0 先建立 ok 历史，B1 才是一次**真实的 ok→auth_failed 转换**（而不是「无历史首次失败」）。
+    # 全程 notifier 注入、fetcher 注入：一次真实外呼都不会发生。
+    tmp = _workdir()
+    cfg, state = _cfg_and_state(tmp, "durable.yaml")
+    notifier = _FlakyNotifier(working=False)          # 先全程投递失败
+    fetcher = _ScriptedFetcher([(200, _ok_body())]
+                               + [(401, BODY_CODE_100)] * 3
+                               + [(200, _ok_body())] * 3)
+    steps = {}
+
+    def run(label):
+        handler, records = _log_capture()
+        try:
+            rc, crash = _check_catching(config_path=cfg, state_path=state,
+                                        fetcher=fetcher, notifier=notifier)
+        finally:
+            tool.LOG.removeHandler(handler)
+        steps[label] = {
+            "rc": rc, "crash": crash,
+            "blob": "\n".join(r.getMessage() for r in records),
+            "pending": _state_field(state, "alert_pending")[0],
+            "msg": _state_field(state, "alert_message")[0],
+        }
+        return steps[label]
+
+    a0 = run("A0")
+    check("[27] A0 建立 ok 历史：rc==0、不产生任何投递尝试",
+          a0["crash"] is None and a0["rc"] == 0 and notifier.attempts == 0,
+          "rc=%r crash=%s attempts=%d" % (a0["rc"], a0["crash"], notifier.attempts))
+    check("[27] A0 ok 态的状态文件 alert_pending=false（无债务）", a0["pending"] is False,
+          "alert_pending=%r" % (a0["pending"],))
+
+    # --- B1：真正的 ok→auth_failed 转换，投递失败 ---
+    b1 = run("B1")
+    check("[27] B1 ok→auth_failed：rc==2（0/2/3 契约不变）、投递尝试 1 次、送达 0 条",
+          b1["crash"] is None and b1["rc"] == 2 and notifier.attempts == 1
+          and notifier.delivered == [],
+          "rc=%r attempts=%d delivered=%d" % (b1["rc"], notifier.attempts, len(notifier.delivered)))
+    check("[27] G1 B1 投递失败 → 状态文件**显式字段** alert_pending=true",
+          b1["pending"] is True, "alert_pending=%r" % (b1["pending"],))
+    check("[27] G1 B1 未送达的告警原文被持久化（补投要有原文可用）",
+          isinstance(b1["msg"], str) and "--login" in b1["msg"], "alert_message=%r" % (b1["msg"],))
+    check("[27] G1 B1 投递失败当次就有『未送达』日志标记（不是等到下一次运行才可见）",
+          marker in b1["blob"], b1["blob"][-500:])
+
+    # --- B2：状态与上次完全相同（should_alert 返回 False），但必须**重试投递** ---
+    b2 = run("B2")
+    check("[27] B2 同类别重复：rc==2、**仍重试投递**（累计尝试 2 次）、仍 0 送达",
+          b2["crash"] is None and b2["rc"] == 2 and notifier.attempts == 2
+          and notifier.delivered == [],
+          "rc=%r attempts=%d" % (b2["rc"], notifier.attempts))
+    check("[27] G1 B2 日志里出现『未送达』标记（每次运行都可见，不再只剩『不重复告警』）",
+          marker in b2["blob"], b2["blob"][-500:])
+
+    b3 = run("B3")
+    check("[27] B3 继续重试（累计尝试 3 次、仍 0 送达）",
+          b3["crash"] is None and b3["rc"] == 2 and notifier.attempts == 3
+          and notifier.delivered == [],
+          "rc=%r attempts=%d" % (b3["rc"], notifier.attempts))
+    check("[27] G1 B3 日志里同样出现『未送达』标记", marker in b3["blob"], b3["blob"][-500:])
+
+    # --- C1：恢复为 ok，恢复通知走**同一个**重试机制（投递仍然失败）---
+    c1 = run("C1")
+    check("[27] C1 auth_failed→ok：rc==0、恢复通知也被尝试投递（累计 4 次）、送达仍 0 条",
+          c1["crash"] is None and c1["rc"] == 0 and notifier.attempts == 4
+          and notifier.delivered == [],
+          "rc=%r attempts=%d" % (c1["rc"], notifier.attempts))
+    check("[27] G1 C1 恢复通知未送达 → alert_pending 仍 true，且存的是**恢复**通知原文",
+          c1["pending"] is True and isinstance(c1["msg"], str) and "已恢复" in c1["msg"],
+          "pending=%r msg=%r" % (c1["pending"], c1["msg"]))
+
+    # --- D1：投递恢复 + 状态没有变化 → 必须补投，且只补投一次 ---
+    notifier.working = True
+    d1 = run("D1")
+    check("[27] D1 投递恢复 → 补投那条未送达的恢复通知（尝试 5 次、送达 1 条）",
+          d1["crash"] is None and d1["rc"] == 0 and notifier.attempts == 5
+          and len(notifier.delivered) == 1,
+          "rc=%r attempts=%d delivered=%d" % (d1["rc"], notifier.attempts, len(notifier.delivered)))
+    check("[27] G1 D1 补投的正是 C1 那条原文（一字不差，不是重造的另一条）",
+          notifier.delivered == [c1["msg"]], repr(notifier.delivered))
+    check("[27] G1 D1 **送达成功之后**才清标记：alert_pending→false、alert_message→null",
+          d1["pending"] is False and d1["msg"] is None,
+          "pending=%r msg=%r" % (d1["pending"], d1["msg"]))
+
+    # --- D2：债务已清 → 不得重复投递 ---
+    d2 = run("D2")
+    check("[27] D2 状态仍是 ok、债务已清 → 不再投递（尝试仍 5 次、送达仍 1 条）——**不重复**",
+          d2["crash"] is None and d2["rc"] == 0 and notifier.attempts == 5
+          and len(notifier.delivered) == 1,
+          "rc=%r attempts=%d delivered=%d" % (d2["rc"], notifier.attempts, len(notifier.delivered)))
+    check("[27] G1 全序列**恰好送达 1 条**告警（恰好一次：不重复、不丢失）",
+          len(notifier.delivered) == 1 and len(set(notifier.delivered)) == 1,
+          "delivered=%r" % (notifier.delivered,))
+    check("[27] 退出码全程只有 0/2（投递成败绝不改变退出码契约）",
+          [steps[k]["rc"] for k in ("A0", "B1", "B2", "B3", "C1", "D1", "D2")] == [0, 2, 2, 2, 0, 0, 0],
+          repr([steps[k]["rc"] for k in ("A0", "B1", "B2", "B3", "C1", "D1", "D2")]))
+
+    # ===== 子场景：投递在**状态没有变化**时恢复 → 那条丢失的失败告警必须被补投 =====
+    # 这一条是「不丢失」的直接证据：B1 那条告警在投递恢复后必须原样落地，而不是被跳过。
+    tmp2 = _workdir()
+    cfg2, state2 = _cfg_and_state(tmp2, "durable_same_state.yaml")
+    n2 = _FlakyNotifier(working=False)
+    f2 = _ScriptedFetcher([(200, _ok_body())] + [(401, BODY_CODE_100)] * 4)
+
+    rc_ok2, crash_ok2 = _check_catching(config_path=cfg2, state_path=state2,
+                                        fetcher=f2, notifier=n2)
+    check("[27] 子场景前置：ok 历史建立 rc==0", crash_ok2 is None and rc_ok2 == 0,
+          "rc=%r crash=%s" % (rc_ok2, crash_ok2))
+    rc_b2, crash_b2 = _check_catching(config_path=cfg2, state_path=state2,
+                                      fetcher=f2, notifier=n2)
+    lost = _state_field(state2, "alert_message")[0]
+    check("[27] 子场景 B1 转换发生但投递失败：rc==2、尝试 1 次、送达 0 条、pending=true",
+          crash_b2 is None and rc_b2 == 2 and n2.attempts == 1 and n2.delivered == []
+          and _state_field(state2, "alert_pending")[0] is True,
+          "rc=%r attempts=%d pending=%r" % (rc_b2, n2.attempts,
+                                            _state_field(state2, "alert_pending")[0]))
+
+    n2.working = True     # 投递恢复；但**状态依然是 auth_failed**（没有任何新转换）
+    rc_r, crash_r = _check_catching(config_path=cfg2, state_path=state2,
+                                    fetcher=f2, notifier=n2)
+    check("[27] G1 子场景 投递恢复且状态未变 → 那条丢失的告警被补投（恰好 1 条）",
+          crash_r is None and rc_r == 2 and len(n2.delivered) == 1,
+          "rc=%r attempts=%d delivered=%r" % (rc_r, n2.attempts, n2.delivered))
+    check("[27] G1 子场景 补投的就是 B1 那条告警原文（**没有丢失**）",
+          n2.delivered == [lost], "delivered=%r lost=%r" % (n2.delivered, lost))
+    check("[27] G1 子场景 补投后 alert_pending 被清掉",
+          _state_field(state2, "alert_pending")[0] is False,
+          "alert_pending=%r" % (_state_field(state2, "alert_pending")[0],))
+    attempts_before = n2.attempts
+    rc_x, crash_x = _check_catching(config_path=cfg2, state_path=state2,
+                                    fetcher=f2, notifier=n2)
+    check("[27] G1 子场景 债务已清后再跑一次 → 不再重复投递（不重复）",
+          crash_x is None and rc_x == 2 and n2.attempts == attempts_before
+          and len(n2.delivered) == 1,
+          "rc=%r attempts=%d (was %d) delivered=%d"
+          % (rc_x, n2.attempts, attempts_before, len(n2.delivered)))
+
+    # ===== G4：notifier 抛 SystemExit =====
+    # `except Exception` **故意不接** SystemExit，所以它会照常逃出 check()；但那一刻
+    # alert_pending=true 已经在盘上 ⇒ 下一次运行照样补投（这正是「状态写了、rc 没返回」
+    # 那条路径，不需要也不应该靠 catch BaseException 去堵）。
+    tmp3 = _workdir()
+    cfg3, state3 = _cfg_and_state(tmp3, "durable_sysexit.yaml")
+    f3 = _ScriptedFetcher([(200, _ok_body())] + [(401, BODY_CODE_100)] * 2)
+    rc_ok3, crash_ok3 = _check_catching(config_path=cfg3, state_path=state3,
+                                        fetcher=f3, notifier=_Recorder())
+    check("[27] G4 前置：ok 历史建立 rc==0", crash_ok3 is None and rc_ok3 == 0,
+          "rc=%r crash=%s" % (rc_ok3, crash_ok3))
+
+    def exiting_notifier(_message):
+        raise SystemExit(7)
+
+    rc_exit, crash_exit = _check_catching_base(config_path=cfg3, state_path=state3,
+                                               fetcher=f3, notifier=exiting_notifier)
+    check("[27] G4 SystemExit 照常逃出 check()（没有被 catch BaseException 吞掉）",
+          rc_exit is None and crash_exit is not None and "SystemExit" in crash_exit,
+          "rc=%r crash=%r" % (rc_exit, crash_exit))
+    check("[27] G4 逃出时**状态已落盘**且带 alert_pending=true（『状态写了、rc 没返回』）",
+          _state_field(state3, "status")[0] == "auth_failed"
+          and _state_field(state3, "alert_pending")[0] is True,
+          "status=%r pending=%r" % (_state_field(state3, "status")[0],
+                                    _state_field(state3, "alert_pending")[0]))
+    g4_msg = _state_field(state3, "alert_message")[0]
+
+    handler3, records3 = _log_capture()
+    rec3 = _Recorder()
+    try:
+        rc_retry, crash_retry = _check_catching(config_path=cfg3, state_path=state3,
+                                                fetcher=f3, notifier=rec3)
+    finally:
+        tool.LOG.removeHandler(handler3)
+    blob3 = "\n".join(r.getMessage() for r in records3)
+    check("[27] G4 下一次运行补投那条被 SystemExit 打断的告警（恰好 1 条）",
+          crash_retry is None and rc_retry == 2 and len(rec3.messages) == 1,
+          "rc=%r n=%d crash=%s" % (rc_retry, len(rec3.messages), crash_retry))
+    check("[27] G4 补投的原文与逃出前落盘的那条一致，且点名 --login",
+          rec3.messages == [g4_msg] and "--login" in (g4_msg or ""),
+          "delivered=%r recorded=%r" % (rec3.messages, g4_msg))
+    check("[27] G4 补投成功 → alert_pending → false",
+          _state_field(state3, "alert_pending")[0] is False,
+          "alert_pending=%r" % (_state_field(state3, "alert_pending")[0],))
+    check("[27] G4 补投那次运行日志里出现『未送达』标记（运维可见）",
+          marker in blob3, blob3[-500:])
+
+
 def main():
     print("=" * 70)
     print("知乎 Cookie 工具行为级测试（离线）：写入守卫 / EOL / 幂等 / 回读校验 / 状态变化告警")
@@ -1805,6 +2135,7 @@ def main():
     test_alert_delivery_failure_is_contained()
     test_deep_yaml_is_config_error()
     test_login_refresh_writeback_is_observable()
+    test_alert_delivery_is_durable()
     test_real_config_untouched()
 
     print("=" * 70)

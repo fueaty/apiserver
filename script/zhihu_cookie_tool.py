@@ -24,6 +24,12 @@
 仅**类别变化**时告警：ok→非ok 一定响铃（含 403/429 风控——它意味着采集已被静默阻断），
 →ok 发恢复通知，同一类别反复出现不重复告警。
 
+告警投递是**持久化义务**（本工具的立身之本就是「出事会响」）
+-----------------------------------------------------------------------------
+状态文件除判定本身还记 `alert_pending` / `alert_message`：告警没送出去就保持 true，
+之后**每一次**运行都会重试（即使类别没变、should_alert 返回 False），只有投递成功才清掉。
+于是「投递失败的告警」不会在故障窗口里消失。退出码**不受投递结果影响**，仍是 0/2/3。
+
 依赖约束
 --------
 playwright **只在 --login / --refresh 内部延迟导入**，因此本文件可在没有 playwright
@@ -99,6 +105,10 @@ EXIT_BY_STATE = {
 }
 
 AUTH_LABELS = {101: "无凭证/未识别", 100: "凭证过期"}
+
+# 告警投递是**持久化义务**，不是一次性副作用：投递失败时状态文件会记 alert_pending=true，
+# 之后每次运行都会重试，并在日志里打出这一行（运维 grep 这个标记就知道「有告警没送到」）。
+PENDING_ALERT_MARKER = "未送达告警"
 
 
 class TransportError(Exception):
@@ -322,6 +332,37 @@ def _write_state(path, record):
         raise StateWriteError("%s (%s: %s)" % (path, type(e).__name__, e))
 
 
+def _state_record(state, code, detail, pending_message):
+    """构造状态文件记录：判定本身 + **这条转换的告警有没有真的送出去**。
+
+    alert_pending / alert_message 是「投递失败不再丢」的唯一依据。只要 alert_pending
+    为 true，下一次运行（**即使状态没有变化、should_alert 返回 False**）也会重新投递
+    这条告警，直到 cookie_store.notify 返回 True 才清掉它。没有这两个字段时，「状态
+    变了但告警没送到」在磁盘上和「状态变了且告警送到了」完全无法区分 ⇒ 下一次同类
+    失败被判成「无变化」而永久静默（企微是本项目唯一告警通道）。
+
+    alert_message 存的是告警**原文**，好让重试能一字不差地补投。它由
+    state_alert_message()/recovery_alert_message() 生成，只含站点名 / code / detail，
+    详细程度与日志相同 —— 不含 cookie 明文（[7]/[15]/[16] 有用例钉住这一点）。
+    """
+    return {
+        "status": state,
+        "ts": _now(),
+        "code": code,
+        "detail": detail,
+        "alert_pending": bool(pending_message),
+        "alert_message": pending_message or None,
+    }
+
+
+def _pending_alert(record):
+    """从状态记录里取出「上一次转换的告警，且尚未送达」的原文；没有则返回 ""。"""
+    if not record.get("alert_pending"):
+        return ""
+    message = record.get("alert_message")
+    return message if isinstance(message, str) else ""
+
+
 # ---------------------------------------------------------------------------
 # 告警文案
 # ---------------------------------------------------------------------------
@@ -429,7 +470,14 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
             state, code = STATE_ERROR, 0
 
     LOG.info("状态文件: %s", resolved_state)
-    previous = str(_read_state(resolved_state).get("status") or "")
+    previous_record = _read_state(resolved_state)
+    previous = str(previous_record.get("status") or "")
+    # 上一次转换的告警如果**没有送到**，它就是一笔尚未偿还的债：本次必须重试，
+    # 哪怕本次状态与上次完全相同（那种情况下 should_alert 会返回 False）。
+    pending_message = _pending_alert(previous_record)
+    if pending_message:
+        LOG.error("%s：状态文件 alert_pending=true —— 上一次状态转换的告警没有送达，"
+                  "本次运行会重试投递（这是运维唯一会看到这件事的地方）", PENDING_ALERT_MARKER)
 
     alert = None
     if state == STATE_OK:
@@ -449,37 +497,68 @@ def check(config_path=None, state_path=None, fetcher=None, notifier=None,
             LOG.warning("上次状态 %r → 本次 %r：不重复告警",
                         previous or "<无历史>", state)
 
-    # ⚠️ 顺序是刻意的：**先把状态转换落盘，再发告警**。
-    # 早期实现先 notify 再 _write_state，于是「通知投递失败」会把已经判定完的状态转换
-    # 一起丢掉（投递失败 ⇒ 状态文件仍是旧状态 ⇒ 下次同类别失败被判成「无变化」而静默）。
-    # 现在无论投递成功 / 失败 / 抛异常，状态文件都已经是本次的新状态。
+    # 本次要送达的告警 = 本次转换的告警（若有）优先，否则是上次欠下的那条。
+    # 为什么**新的取代旧的**（而不是排队补发）：状态机的语义是「只在类别变化时公告当前
+    # 类别」，而 →ok 的恢复通知本身就讲清了上一段故障的结局；在已经恢复之后再补发一条
+    # 「状态=认证失败，需要人工 --login 扫码登录」只会变成一次需要人工去排除的**假警报**。
+    # 被取代的那条在日志里明确记录，绝不静默丢弃。
+    if alert and pending_message and alert != pending_message:
+        LOG.warning("%s：上一次未送达的告警已被本次转换的告警取代（旧告警描述的状态已经过去，"
+                    "本次告警已说明结局）", PENDING_ALERT_MARKER)
+    to_deliver = alert or pending_message
+
+    # ⚠️ 顺序是刻意的：**先把「这次转换的公告还没送到」落盘，再尝试投递**。
+    # 早期实现只落盘状态、把「投递成败」留在内存里，于是「通知投递失败」= 状态转换被判成
+    # 已公告 ⇒ 投递恢复后也永远补不回来（整个故障窗口静默）。现在只要 alert_pending=true
+    # 留在盘上，下一次运行就一定会重试；只有投递**成功**才会把它清掉。
+    # 代价是每次有告警的运行会写两次状态文件（先标记、成功后清标记）——这是「送达与否必须
+    # 持久化」的直接结果，顺序锁见 tests/test_zhihu_cookie_refresh.py 的 [24]。
     state_written = True
     if dry_run:
         LOG.info("[dry-run] 不写状态文件（实际会写 %s）", resolved_state)
     else:
         try:
-            _write_state(resolved_state, {
-                "status": state, "ts": _now(), "code": code, "detail": detail,
-            })
+            _write_state(resolved_state, _state_record(state, code, detail, to_deliver))
         except StateWriteError as e:
             LOG.error("状态文件不可用：%s；本次判定 state=%s 无法记账，按运维错误返回 rc=%d",
                       e, state, EXIT_ERROR)
             state_written = False
 
-    if alert:
+    if to_deliver:
         if dry_run:
-            LOG.info("[dry-run] 本应发送通知：%s", alert)
+            LOG.info("[dry-run] 本应发送通知：%s", to_deliver)
         else:
             delivered = False
             try:
-                delivered = bool(cookie_store.notify(alert, notifier))
+                delivered = bool(cookie_store.notify(to_deliver, notifier))
             except Exception as e:
                 # cookie_store.notify 的契约是「绝不抛」；这里再兜一层，保证即使那条契约
                 # 被破坏（换实现 / 打补丁 / BaseException 之外的任何东西），也不会把本次
-                # 判定（rc + 已落盘的状态）毁掉。
+                # 判定（rc + 已落盘的 pending 标记）毁掉。
+                # 注意这里**只**接 Exception：SystemExit / KeyboardInterrupt 仍然照常逃出去，
+                # 但那时 alert_pending=true 已经在盘上，下一次运行会补投（见 [27]）。
                 LOG.error("告警投递未预期异常（%s: %s）", type(e).__name__, e)
-            if not delivered:
-                LOG.error("告警投递失败：%s；状态转换已落盘，本次 rc 不受投递结果影响", alert)
+            if delivered:
+                if not state_written:
+                    LOG.error("告警本次已送达，但状态文件不可用（%s 标记无法写入/清除），"
+                              "下次运行可能重复投递一次", PENDING_ALERT_MARKER)
+                else:
+                    # 只有投递成功才清标记；清标记失败宁可下次重复投一次，
+                    # 也绝不能让「已送达」被误写成「未送达」——反过来才是永久静默。
+                    try:
+                        _write_state(resolved_state, _state_record(state, code, detail, ""))
+                    except StateWriteError as e:
+                        LOG.error("告警已送达但无法清除 alert_pending 标记（%s）：状态文件仍标记"
+                                  "未送达，下次运行会重复投递一次；按状态文件不可用返回 rc=%d",
+                                  e, EXIT_ERROR)
+                        state_written = False
+                    else:
+                        LOG.info("%s：已成功送达（状态文件 alert_pending → false）",
+                                 PENDING_ALERT_MARKER)
+            else:
+                LOG.error("告警投递失败：%s；状态转换已落盘（本次 rc 不受投递结果影响）——"
+                          "%s：状态文件 alert_pending 保持 true，下次运行会继续重试",
+                          to_deliver, PENDING_ALERT_MARKER)
 
     if not state_written:
         return EXIT_ERROR
